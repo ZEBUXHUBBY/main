@@ -1,5 +1,6 @@
 -- AE Strategist single-UI entrypoint.
 -- Stable core = hidden data engine. OwnedStats = real-copy stats. Dashboard = only visible UI.
+-- Runtime data is event-driven: no recurring getgc/live scans.
 -- No AE_Assistant dependency.
 
 local ROOT = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/AE_Strategist/"
@@ -22,6 +23,7 @@ end
 
 if type(ENV.AE_STRATEGIST_VISUAL)=="table" and type(ENV.AE_STRATEGIST_VISUAL.Destroy)=="function" then pcall(ENV.AE_STRATEGIST_VISUAL.Destroy) end
 if type(ENV.AE_STRATEGIST_DASHBOARD)=="table" and type(ENV.AE_STRATEGIST_DASHBOARD.Destroy)=="function" then pcall(ENV.AE_STRATEGIST_DASHBOARD.Destroy) end
+if type(ENV.AE_STRATEGIST_RUNTIME)=="table" and type(ENV.AE_STRATEGIST_RUNTIME.Destroy)=="function" then pcall(ENV.AE_STRATEGIST_RUNTIME.Destroy) end
 local function cleanupGui(root)
     if not root then return end
     for _,name in ipairs({"AE_Strategist_VisualAddon","AE_Strategist_DashboardV2","AE_Strategist_VisualV2"}) do
@@ -55,8 +57,6 @@ if statSource then
         if args:sub(1,4)=="(ci(" then return "tonumber(("..args:sub(2,-2).."))" end
         return "tonumber"..args
     end)
-    -- Unit DB stores CritDamage as 100-style percent while traits store +0.35.
-    -- Normalize additive trait/equipment crit values to the unit's native scale.
     statSource=statSource:gsub(
         "if exact and exact%.CritChance~=nil then cc=exact%.CritChance else cc=cc%+ccAdd end",
         "if exact and exact.CritChance~=nil then cc=exact.CritChance else cc=cc+((cc>1) and ccAdd*100 or ccAdd) end",1)
@@ -69,19 +69,41 @@ else
 end
 if Core and type(Core.RefreshAnalysis)=="function" then pcall(Core.RefreshAnalysis) end
 
--- 3) Dashboard only.
+-- 3) Event-driven runtime cache. Passive OnClientEvent/Changed listeners only.
+local bridgeSource,bridgeErr=fetch("runtime_bridge.lua")
+if bridgeSource then
+    if not runSource("runtime bridge",bridgeSource) then
+        warn("[AE Strategist] runtime bridge failed; manual live refresh still available")
+    end
+else
+    warn("[AE Strategist] runtime bridge fetch failed:",bridgeErr)
+end
+
+-- 4) Dashboard only.
 task.spawn(function()
     local dashSource,dashErr=fetch("dashboard_v2.lua")
     if not dashSource then warn("[AE Strategist] dashboard fetch failed:",dashErr); return end
 
-    -- Performance: never auto-sync / auto-scan in the background on startup.
-    -- Economy learning is opt-in and much slower when enabled.
+    -- No background heavy work. Economy learner is OFF by default.
     dashSource=dashSource:gsub("Running = true,","Running = false,",1)
     dashSource=dashSource:gsub('local LearnButton=button%(EconStatus,"AUTO: ON"','local LearnButton=button(EconStatus,"AUTO: OFF"',1)
     dashSource=dashSource:gsub(
         "    pcall%(function%(%) Dashboard%.Sync%(false%) end%)\n    Dashboard%.StartTracker%(%)",
         "    pcall(function() Dashboard.Sync(false) end)",1)
-    dashSource=dashSource:gsub("task%.wait%(2%.0%)","task.wait(8.0)",1)
+
+    -- If AUTO learner is manually enabled, read the event cache instead of Core.RefreshLive/getgc.
+    dashSource=dashSource:gsub(
+        "function Dashboard%.TrackerTick%(%)\n    if Dashboard%.Destroyed or not Dashboard%.Tracker%.Running then return end\n    pcall%(Core%.RefreshLive%)\n    local state=Core%.GetState%(%)\n    local live=state and state%.LastLive",
+        "function Dashboard.TrackerTick()\n    if Dashboard.Destroyed or not Dashboard.Tracker.Running then return end\n    local state=Core.GetState()\n    local bridge=ENV.AE_STRATEGIST_RUNTIME\n    local snap=bridge and bridge.GetSnapshot and bridge.GetSnapshot() or nil\n    state.LastLive=state.LastLive or {}\n    if snap then\n        if snap.Yen~=nil then state.LastLive.Yen=snap.Yen end\n        if snap.Wave~=nil then state.LastLive.Wave=snap.Wave end\n    end\n    local live=state and state.LastLive",1)
+
+    -- Learner may sample cache frequently because this is now cheap, but it must NOT rebuild the UI.
+    dashSource=dashSource:gsub("task%.wait%(2%.0%)","task.wait(1.0)",1)
+    dashSource=dashSource:gsub("    pcall%(Dashboard%.Refresh%)\nend\n\nfunction Dashboard%.StartTracker", "end\n\nfunction Dashboard.StartTracker",1)
+
+    -- Every manual dashboard refresh imports the latest event cache without scanning the client.
+    dashSource=dashSource:gsub(
+        "function Dashboard%.Refresh%(%)\n    if Dashboard%.Destroyed then return end\n    local state=Core%.GetState%(%)",
+        "function Dashboard.Refresh()\n    if Dashboard.Destroyed then return end\n    local state=Core.GetState()\n    local bridge=ENV.AE_STRATEGIST_RUNTIME\n    local snap=bridge and bridge.GetSnapshot and bridge.GetSnapshot() or nil\n    state.LastLive=state.LastLive or {}\n    if snap then\n        if snap.Yen~=nil then state.LastLive.Yen=snap.Yen end\n        if snap.Wave~=nil then state.LastLive.Wave=snap.Wave end\n    end",1)
 
     dashSource=dashSource:gsub("local LearnButton=button%(","local LearnButton\nLearnButton=button(",1)
     dashSource=dashSource:gsub(
@@ -119,5 +141,5 @@ task.spawn(function()
     end
     if Core and Core.Gui then pcall(function() Core.Gui.Enabled=false end) end
     if D and D.Gui then for _,x in ipairs(D.Gui:GetDescendants()) do if x:IsA("TextButton") and x.Text=="CORE" then x:Destroy() end end end
-    print("[AE Strategist] single Dashboard UI loaded | background sync OFF")
+    print("[AE Strategist] single Dashboard UI loaded | event-driven runtime cache | no polling")
 end)
