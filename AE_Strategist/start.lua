@@ -74,6 +74,15 @@ task.spawn(function()
     local dashSource,dashErr=fetch("dashboard_v2.lua")
     if not dashSource then warn("[AE Strategist] dashboard fetch failed:",dashErr); return end
 
+    -- Performance: never auto-sync / auto-scan in the background on startup.
+    -- Economy learning is opt-in and much slower when enabled.
+    dashSource=dashSource:gsub("Running = true,","Running = false,",1)
+    dashSource=dashSource:gsub('local LearnButton=button%(EconStatus,"AUTO: ON"','local LearnButton=button(EconStatus,"AUTO: OFF"',1)
+    dashSource=dashSource:gsub(
+        "    pcall%(function%(%) Dashboard%.Sync%(false%) end%)\n    Dashboard%.StartTracker%(%)",
+        "    pcall(function() Dashboard.Sync(false) end)",1)
+    dashSource=dashSource:gsub("task%.wait%(2%.0%)","task.wait(8.0)",1)
+
     dashSource=dashSource:gsub("local LearnButton=button%(","local LearnButton\nLearnButton=button(",1)
     dashSource=dashSource:gsub(
         "for i,obj in ipairs%(objectives%) do\n    local b = button%(TeamPage,obj,",
@@ -104,7 +113,11 @@ task.spawn(function()
 
     if not runSource("dashboard",dashSource) then return end
     local D=ENV.AE_STRATEGIST_DASHBOARD
+    if D and D.Tracker then
+        D.Tracker.Running=false
+        D.Tracker.Token=(D.Tracker.Token or 0)+1
+    end
     if Core and Core.Gui then pcall(function() Core.Gui.Enabled=false end) end
     if D and D.Gui then for _,x in ipairs(D.Gui:GetDescendants()) do if x:IsA("TextButton") and x.Text=="CORE" then x:Destroy() end end end
-    print("[AE Strategist] single Dashboard UI loaded with owned-copy stats")
+    print("[AE Strategist] single Dashboard UI loaded | background sync OFF")
 end)
