@@ -49,6 +49,13 @@ return function(Brain, config)
         return tostring(value or ""):lower():gsub("[^%w]", "")
     end
 
+    local function clamp(value, minimum, maximum)
+        value = tonumber(value) or minimum
+        if value < minimum then return minimum end
+        if value > maximum then return maximum end
+        return value
+    end
+
     local function fmt(value, digits)
         value = tonumber(value)
         if not value then return "—" end
