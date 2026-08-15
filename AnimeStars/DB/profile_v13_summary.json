@@ -1,0 +1,125 @@
+{
+  "source": "session_v13_1786816875",
+  "placeId": 122553263569744,
+  "session": {
+    "durationSeconds": 117.5660354,
+    "incomingPackets": 335,
+    "incomingItems": 2092,
+    "outgoingCallsObserved": 206,
+    "outgoingDecodedItems": 0,
+    "profilerErrors": 0
+  },
+  "combat": {
+    "enemyDamagedPayloadInference": {
+      "1": "enemy UUID",
+      "2": "damage dealt",
+      "3": "remaining HP",
+      "4": "critical flag",
+      "confidence": "high",
+      "basis": "For repeated hits on the same UUID, prior remaining HP minus next remaining HP exactly matches field 2; field 4=true aligns with larger hit values."
+    },
+    "combatDamageDealt": "Observed as aggregate damage confirmation for the attack/event window.",
+    "outgoingCadence": {
+      "medianSeconds": 0.5997919,
+      "intervalsRoundedTo0_60Seconds": 172,
+      "note": "Do not infer a server bypass. This is observed normal traffic cadence."
+    }
+  },
+  "power": {
+    "start": 19886.264752800544,
+    "end": 32609.659045193894,
+    "gain": 12723.39429239335,
+    "averagePerMinute": 6515.950396515034,
+    "medianTickGain": 66.86605621080162,
+    "medianUpdateIntervalSeconds": 0.6328783999924781,
+    "overworldPerMinuteApprox": 6588.890846386719,
+    "dungeonPerMinuteApprox": 6525.382439333856,
+    "inference": "Power rate stayed very similar in overworld and dungeon and continued during intervals without damage, so Power gain is not simply proportional to kill speed/damage."
+  },
+  "heroObserved": {
+    "hero": "Hawk",
+    "skill": {
+      "ability": "KokutoSoshu",
+      "cooldownSeconds": 12,
+      "lockDurationSeconds": 1.6666666666666667,
+      "swapLockSeconds": 3.166666666666667,
+      "damageDelaySeconds": 1.1833333333333333,
+      "attackOffset": 30,
+      "aoeSize": {"X": 16.100000381469727, "Y": 16.100000381469727, "Z": 69}
+    },
+    "ultimate": {
+      "ability": "KokutoArakure",
+      "cooldownSeconds": 48,
+      "lockDurationSeconds": 1.5555555555555556,
+      "swapLockSeconds": 3.0555555555555555,
+      "damageDelaySeconds": 0.4444444444444444,
+      "attackOffset": 8,
+      "aoeSize": {"X": 17.25, "Y": 17.25, "Z": 17.25},
+      "observedPassive": {
+        "name": "MasterSwordsman",
+        "durationSeconds": 24,
+        "flatCriticalDamage": 55,
+        "flatCriticalChance": 5
+      }
+    }
+  },
+  "dungeon": {
+    "zone": "Dungeon:1",
+    "enemyCountPerObservedRoom": 6,
+    "hpRule": {
+      "room1": 3750,
+      "room2": 8400,
+      "room2PlusMultiplierPerRoom": 1.68,
+      "formulaForRoomAtLeast2": "8400 * 1.68^(room-2)"
+    },
+    "rooms": {
+      "1": {"hpEach": 3750, "clearSeconds": 6.5319744},
+      "2": {"hpEach": 8400, "clearSeconds": 5.6660236},
+      "3": {"hpEach": 14112, "clearSeconds": 4.3662218},
+      "4": {"hpEach": 23708.16, "clearSeconds": 3.6988368},
+      "5": {"hpEach": 39829.7088, "clearSeconds": 4.7327307},
+      "6": {"hpEach": 66913.910784, "clearSeconds": 6.8302514},
+      "7": {"hpEach": 112415.37011712, "clearSeconds": 6.5684363},
+      "8": {"hpEach": 188857.82179676, "clearSeconds": 8.0299594},
+      "9": {"hpEach": 317281.14061856, "clearSeconds": 9.7661665},
+      "10": {"hpEach": 533032.31623918, "clearSeconds": null}
+    },
+    "authoritativeEnemyEvents": [
+      "enemies/sync",
+      "enemies/added",
+      "enemies/respawned",
+      "enemies/damaged",
+      "enemies/died"
+    ],
+    "important": "Server events include enemy Index/name, UUID, Health, MaxHealth, Alive, GroundPosition and CFrame. Prefer this registry over Workspace-only scanning."
+  },
+  "gacha": {
+    "path": "gacha/results",
+    "resultBatches": 24,
+    "rollsObserved": 48,
+    "medianBatchIntervalSeconds": 4.8009209,
+    "rarities": {"Common": 25, "Uncommon": 16, "Rare": 5, "Epic": 2},
+    "units": {"Namy": 25, "Jimbe": 16, "Usoup": 5, "Senjy": 2},
+    "autoAction": {"Fuse": 48},
+    "pitySyncKey": "GachaStats.PityCounters.Champions_skylands",
+    "spinSyncKey": "GachaStats.ChampionSpins"
+  },
+  "drops": {
+    "Aura Fragment": 33,
+    "Blessing Shard": 33,
+    "Doujutsu Fragment": 27,
+    "Race Fragment": 24,
+    "Weapon Essence I": 8,
+    "Shard Auto Attack Upgrades": 5,
+    "Haki Fragment": 3,
+    "Weapon Essence II": 2,
+    "Hero Essence I": 1
+  },
+  "profilerNextFixes": [
+    "Build enemy registry from incoming server events instead of depending on Workspace UUID/spawner matching.",
+    "Decode gacha/results instead of the old banner/rollResults assumption.",
+    "Compact or ignore leaderboard/update and guild/leaderboard payload bodies to reduce report bloat.",
+    "Replace the current outgoing __namecall-only capture with a direct FireServer hookfunction attempt plus fallback; record argument count and all args when Path decoding fails.",
+    "Auto-classify ability events from abilities/executed; manual labels are not required for known ability types."
+  ]
+}
