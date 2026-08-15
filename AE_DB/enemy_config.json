@@ -1,0 +1,1 @@
+{"EnemyTypeRarities":{"Elite":"Legendary","Flying":"Rare","Boss":"Secret","Basic":"Rare"},"EnemyScale":{"Elite":0.6,"Flying":0.5,"Boss":0.8,"Basic":0.5},"EnemySpeed":{"Elite":2.04,"Boss":1.68,"Basic":2.4},"EnemyIndexChance":{"Elite":20,"Flying":20,"Boss":30,"Basic":10},"StatusEffectApplyCap":{"Boss":{"HardCrowdControl":10}}}
