@@ -1,15 +1,24 @@
--- AE Strategist recovery entrypoint.
--- Restores the known-working standalone strategist core while Visual V2 is rebuilt.
--- This still does NOT load AE_Assistant.
+-- AE Strategist safe layered entrypoint.
+-- 1) Load the known-working standalone core.
+-- 2) Load the optional visual addon in isolation.
+-- If the addon fails, the core remains fully usable.
+-- This never loads AE_Assistant.
 
-local URL = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/AE_Strategist/main.lua"
+local ROOT = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/AE_Strategist/"
 
-local ok, source = pcall(function()
-    return game:HttpGet(URL)
-end)
+local function fetch(path)
+    local ok, source = pcall(function()
+        return game:HttpGet(ROOT .. path)
+    end)
+    if not ok then
+        return nil, source
+    end
+    return source, nil
+end
 
-if not ok then
-    warn("[AE Strategist] Failed to fetch standalone engine:", source)
+local source, fetchError = fetch("main.lua")
+if not source then
+    warn("[AE Strategist] Failed to fetch standalone core:", fetchError)
     return
 end
 
@@ -24,14 +33,37 @@ end)
 
 local chunk, compileError = loadstring(source)
 if not chunk then
-    warn("[AE Strategist] Compile error:", compileError)
+    warn("[AE Strategist] Core compile error:", compileError)
     return
 end
 
 local ran, runtimeError = pcall(chunk)
 if not ran then
-    warn("[AE Strategist] Runtime error:", runtimeError)
+    warn("[AE Strategist] Core runtime error:", runtimeError)
     return
 end
 
-print("[AE Strategist] recovered standalone core loaded")
+print("[AE Strategist] stable standalone core loaded")
+
+-- Visuals are deliberately optional. Never allow them to take the core down.
+task.spawn(function()
+    local visualSource, visualFetchError = fetch("visual_addon.lua")
+    if not visualSource then
+        warn("[AE Strategist] Visual addon fetch failed; core remains active:", visualFetchError)
+        return
+    end
+
+    local visualChunk, visualCompileError = loadstring(visualSource)
+    if not visualChunk then
+        warn("[AE Strategist] Visual addon compile failed; core remains active:", visualCompileError)
+        return
+    end
+
+    local visualRan, visualRuntimeError = pcall(visualChunk)
+    if not visualRan then
+        warn("[AE Strategist] Visual addon runtime failed; core remains active:", visualRuntimeError)
+        return
+    end
+
+    print("[AE Strategist] optional visual layer loaded")
+end)
