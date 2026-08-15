@@ -3,7 +3,7 @@
 -- Fixes V5 compile failure by avoiding structural regex rewrites.
 -- One-shot manual analysis only; no background work.
 
-local VERSION = "tournament-boot-v6-20260816"
+local VERSION = "tournament-boot-v6.1-20260816"
 local ROOT = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/AE_Strategist/"
 local ENV = getgenv and getgenv() or _G
 local Players = game:GetService("Players")
@@ -48,7 +48,7 @@ local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
 title.Position = UDim2.fromOffset(18,12)
 title.Size = UDim2.new(1,-72,0,30)
-title.Text = "AE • TOURNAMENT OPTIMIZER V6"
+title.Text = "AE • TOURNAMENT OPTIMIZER V6.1"
 title.Font = Enum.Font.GothamBold
 title.TextSize = 17
 title.TextColor3 = Color3.fromRGB(239,241,247)
@@ -97,7 +97,7 @@ close.MouseButton1Click:Connect(function() gui:Destroy() end)
 local nonce = tostring(os.time()).."-"..tostring(math.random(100000,999999))
 local function fetch(path)
     local ok, src = pcall(function()
-        return game:HttpGet(ROOT..path.."?ae_v6="..nonce)
+        return game:HttpGet(ROOT..path.."?ae_v61="..nonce)
     end)
     if not ok then return nil, tostring(src) end
     return src
@@ -109,6 +109,12 @@ local function execute(label, src)
     local ok, re = pcall(fn)
     if not ok then return false, label.." RUNTIME ERROR\n"..tostring(re) end
     return true
+end
+
+local function replacePlain(source, oldText, newText)
+    local s, e = string.find(source, oldText, 1, true)
+    if not s then return nil end
+    return string.sub(source, 1, s - 1) .. newText .. string.sub(source, e + 1)
 end
 
 local function loadCore()
@@ -146,8 +152,7 @@ local function patchV4(src)
         return "tonumber"..args
     end)
 
-    -- PERFORMANCE FIX: replace only the single call site; do not rewrite function structure.
-    -- Accept direct/shallow level rows only. Unknown level formula stays unknown instead of recursively scanning the DB.
+    -- PERFORMANCE FIX: replace only the exact single call site using PLAIN matching.
     local oldLevel = "local lmods=findLevelMods(UnitLevelDB,out.Level)"
     local newLevel = [[local levelRow = UnitLevelDB[out.Level] or UnitLevelDB[tostring(out.Level)]
     if type(levelRow) ~= "table" then
@@ -157,22 +162,19 @@ local function patchV4(src)
         end
     end
     local lmods = levelModsFromRow(levelRow)]]
-    local n
-    src, n = src:gsub(oldLevel, newLevel, 1)
-    if n ~= 1 then
-        return nil, "V6 PATCH ERROR: level call site not found"
-    end
+    local patched = replacePlain(src, oldLevel, newLevel)
+    if not patched then return nil, "V6 PATCH ERROR: level call site not found" end
+    src = patched
 
-    -- INITIAL RENDER FIX: never auto-run expensive trait/equipment what-if for card #1.
+    -- INITIAL RENDER FIX: team cards appear before any expensive what-if advice.
     local oldDetail = "if #team>0 then renderDetail(team[1],1) end"
     local newDetail = [[if #team > 0 then
         detailTitle.Text = "TEAM READY • CLICK A UNIT"
         detailText.Text = "The 6-slot combat team is ready. Click a unit card only when you want its Trait/Equipment what-if calculation. No background work is running."
     end]]
-    src, n = src:gsub(oldDetail, newDetail, 1)
-    if n ~= 1 then
-        return nil, "V6 PATCH ERROR: initial detail call not found"
-    end
+    patched = replacePlain(src, oldDetail, newDetail)
+    if not patched then return nil, "V6 PATCH ERROR: initial detail call not found" end
+    src = patched
 
     return src
 end
@@ -227,4 +229,4 @@ ENV.AE_TOURNAMENT_BOOT_V6 = {
     Destroy = function() if gui then gui:Destroy() end end,
 }
 
-print("[AE Tournament V6] BOOT READY | minimal safe patches")
+print("[AE Tournament V6.1] BOOT READY | plain safe patches")
