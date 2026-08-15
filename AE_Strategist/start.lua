@@ -1,7 +1,7 @@
--- AE Strategist safe layered entrypoint.
+-- AE Strategist safe dashboard entrypoint.
 -- 1) Load the known-working standalone core.
--- 2) Load the optional visual addon in isolation.
--- If the addon fails, the core remains fully usable.
+-- 2) Load Dashboard V2 in isolation.
+-- If the dashboard fails, the core remains fully usable.
 -- This never loads AE_Assistant.
 
 local ROOT = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/AE_Strategist/"
@@ -10,9 +10,7 @@ local function fetch(path)
     local ok, source = pcall(function()
         return game:HttpGet(ROOT .. path)
     end)
-    if not ok then
-        return nil, source
-    end
+    if not ok then return nil, source end
     return source, nil
 end
 
@@ -22,8 +20,8 @@ if not source then
     return
 end
 
--- main.lua uses getCI(value) helpers that return (value, matchedKey).
--- Guard tonumber(getCI(...)) so the matched key cannot become tonumber's base arg.
+-- Core safety guard: getCI returns (value, matchedKey), while tonumber has an
+-- optional second base argument. Collapse getCI to one return in tonumber calls.
 source = source:gsub("tonumber(%b())", function(args)
     if args:sub(1, 7) == "(getCI(" then
         return "tonumber((" .. args:sub(2, -2) .. "))"
@@ -45,33 +43,33 @@ end
 
 print("[AE Strategist] stable standalone core loaded")
 
--- Visuals are deliberately optional. Never allow them to take the core down.
+-- Dashboard is optional and isolated. It can never take the core down.
 task.spawn(function()
-    local visualSource, visualFetchError = fetch("visual_addon.lua")
-    if not visualSource then
-        warn("[AE Strategist] Visual addon fetch failed; core remains active:", visualFetchError)
+    local dashSource, dashFetchError = fetch("dashboard_v2.lua")
+    if not dashSource then
+        warn("[AE Strategist] Dashboard fetch failed; core remains active:", dashFetchError)
         return
     end
 
-    -- Visual L1 hotfix: PlayerGui is a LayerCollector and has no AbsoluteSize.
-    -- Use the active camera viewport instead. Keep this patch isolated from the core.
-    visualSource = visualSource:gsub(
-        'local viewport = pg%.AbsoluteSize or Vector2%.new%(1920,1080%)',
-        'local viewport = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1920,1080)',
+    -- Dashboard V2 preflight hotfix: make LearnButton an upvalue before its
+    -- callback closes over it. This patch is dashboard-only and does not touch core.
+    dashSource = dashSource:gsub(
+        "local LearnButton=button%(",
+        "local LearnButton\nLearnButton=button(",
         1
     )
 
-    local visualChunk, visualCompileError = loadstring(visualSource)
-    if not visualChunk then
-        warn("[AE Strategist] Visual addon compile failed; core remains active:", visualCompileError)
+    local dashChunk, dashCompileError = loadstring(dashSource)
+    if not dashChunk then
+        warn("[AE Strategist] Dashboard compile failed; core remains active:", dashCompileError)
         return
     end
 
-    local visualRan, visualRuntimeError = pcall(visualChunk)
-    if not visualRan then
-        warn("[AE Strategist] Visual addon runtime failed; core remains active:", visualRuntimeError)
+    local dashRan, dashRuntimeError = pcall(dashChunk)
+    if not dashRan then
+        warn("[AE Strategist] Dashboard runtime failed; core remains active:", dashRuntimeError)
         return
     end
 
-    print("[AE Strategist] optional visual layer loaded")
+    print("[AE Strategist] Dashboard V2 loaded")
 end)
