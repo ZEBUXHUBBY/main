@@ -58,6 +58,15 @@ task.spawn(function()
         1
     )
 
+    -- Ensure each objective button closes over its own objective value.
+    dashSource = dashSource:gsub(
+        "for i,obj in ipairs%(objectives%) do\n    local b = button%(TeamPage,obj,",
+        "for i,obj in ipairs(objectives) do\n    local objective = obj\n    local b = button(TeamPage,objective,",
+        1
+    )
+    dashSource = dashSource:gsub("        st%.Strategy = obj", "        st.Strategy = objective", 1)
+    dashSource = dashSource:gsub("    objectiveButtons%[obj%] = b", "    objectiveButtons[objective] = b", 1)
+
     -- Starting Yen is not a full-stage budget. Only replace the hidden core
     -- budget when the stage exposes TotalYen or the runtime learner has a projection.
     dashSource = dashSource:gsub(
