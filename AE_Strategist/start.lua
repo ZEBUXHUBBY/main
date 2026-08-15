@@ -66,6 +66,14 @@ task.spawn(function()
         1
     )
 
+    -- Cache ViewportFrame discovery. Economy tracking refreshes every ~2s, but
+    -- re-scanning the entire PlayerGui that often is unnecessary and can stutter.
+    dashSource = dashSource:gsub(
+        "    rebuildViewports%(state%)\n    renderTeam%(state%)",
+        "    if not Dashboard.LastViewportScan or os.clock() - Dashboard.LastViewportScan > 10 then\n        rebuildViewports(state)\n        Dashboard.LastViewportScan = os.clock()\n    end\n    renderTeam(state)",
+        1
+    )
+
     local dashChunk, dashCompileError = loadstring(dashSource)
     if not dashChunk then
         warn("[AE Strategist] Dashboard compile failed; core remains active:", dashCompileError)
