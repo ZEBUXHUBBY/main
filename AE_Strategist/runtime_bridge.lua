@@ -1,14 +1,13 @@
 --[[
-AE STRATEGIST | EVENT-DRIVEN RUNTIME BRIDGE
--------------------------------------------
-Passive, read-only runtime cache.
-No polling loop and no gameplay remotes are fired.
+AE STRATEGIST | ULTRA-LIGHT EVENT RUNTIME BRIDGE
+-------------------------------------------------
+Read-only cache. No polling. No getgc. No automatic analysis.
 
-Goals:
-- Observe replicated Yen/Wave changes from incoming Replica events.
-- Observe likely GUI/ValueObject Yen/Wave values via Changed signals.
-- Debounce expensive core analysis only when UnitData/HotbarData actually changes.
-- Expose one lightweight Changed BindableEvent for the dashboard.
+Important rule:
+  Runtime events may update tiny scalar caches or mark TeamDirty,
+  but they NEVER call Core.RefreshAnalysis().
+
+Heavy analysis happens only when the user presses SYNC.
 ]]
 
 local Players = game:GetService("Players")
@@ -23,15 +22,15 @@ if type(ENV.AE_STRATEGIST_RUNTIME) == "table" and type(ENV.AE_STRATEGIST_RUNTIME
 end
 
 local Bridge = {
-    Version = "event-bridge-1.0",
+    Version = "event-bridge-2.0-light",
     Yen = nil,
     Wave = nil,
     YenSource = "UNKNOWN",
     WaveSource = "UNKNOWN",
+    TeamDirty = false,
+    TeamDirtyReason = nil,
     Connections = {},
     Destroyed = false,
-    AnalysisQueued = false,
-    LastAnalysisReason = nil,
     Changed = Instance.new("BindableEvent"),
 }
 ENV.AE_STRATEGIST_RUNTIME = Bridge
@@ -41,186 +40,140 @@ local function norm(v)
     return tostring(v or ""):lower():gsub("[^%w]", "")
 end
 
-local function addConnection(c)
+local function connect(c)
     if c then Bridge.Connections[#Bridge.Connections + 1] = c end
     return c
 end
 
 local function setYen(v, source)
     v = tonumber(v)
-    if not v or v < 0 then return end
-    if Bridge.Yen ~= v or Bridge.YenSource ~= source then
-        Bridge.Yen = v
-        Bridge.YenSource = source or "runtime"
-        Bridge.Changed:Fire("Yen", v, Bridge.YenSource)
-    end
+    if not v or v < 0 or Bridge.Yen == v then return end
+    Bridge.Yen = v
+    Bridge.YenSource = source or "runtime"
+    Bridge.Changed:Fire("Yen", v)
 end
 
 local function setWave(v, source)
     v = tonumber(v)
-    if not v or v < 0 or v > 100000 then return end
-    if Bridge.Wave ~= v or Bridge.WaveSource ~= source then
-        Bridge.Wave = v
-        Bridge.WaveSource = source or "runtime"
-        Bridge.Changed:Fire("Wave", v, Bridge.WaveSource)
-    end
+    if not v or v < 0 or v > 100000 or Bridge.Wave == v then return end
+    Bridge.Wave = v
+    Bridge.WaveSource = source or "runtime"
+    Bridge.Changed:Fire("Wave", v)
 end
 
-local function pathTokens(path)
-    local out = {}
-    if type(path) == "table" then
-        for _, v in pairs(path) do
+local YEN = {yen=true,currentyen=true,money=true,cash=true}
+local WAVE = {wave=true,currentwave=true,wavenumber=true,round=true,currentround=true}
+local TEAM_LEAF = {
+    trait=true,equipment=true,equipments=true,statpotential=true,
+    level=true,equipped=true,hotbarslot=true,unitdata=true,hotbardata=true,
+}
+
+local function pathInfo(path)
+    if type(path) ~= "table" then return nil,nil,false,false end
+    local leaf
+    local inUnit = false
+    local inHotbar = false
+    local n = 0
+    for i,v in ipairs(path) do
+        n = n + 1
+        local t = norm(v)
+        leaf = t
+        if t == "unitdata" then inUnit = true end
+        if t == "hotbardata" then inHotbar = true end
+    end
+    -- Some paths are dictionary-like rather than arrays.
+    if n == 0 then
+        for _,v in pairs(path) do
             if type(v) == "string" or type(v) == "number" then
-                out[#out + 1] = norm(v)
+                local t = norm(v)
+                leaf = t
+                if t == "unitdata" then inUnit = true end
+                if t == "hotbardata" then inHotbar = true end
             end
         end
-    elseif path ~= nil then
-        out[1] = norm(path)
     end
-    return out
+    return leaf, path, inUnit, inHotbar
 end
 
-local function tokenMatches(tokens, wanted)
-    for _, t in ipairs(tokens) do
-        for _, w in ipairs(wanted) do
-            if t == w or t:find(w, 1, true) then return true end
-        end
-    end
-    return false
+local function markTeamDirty(reason)
+    Bridge.TeamDirty = true
+    Bridge.TeamDirtyReason = reason
+    -- Tiny notification only. Never run analysis here.
+    Bridge.Changed:Fire("TeamDirty", reason)
 end
 
-local function queueAnalysis(reason)
-    if Bridge.AnalysisQueued or Bridge.Destroyed then return end
-    Bridge.AnalysisQueued = true
-    Bridge.LastAnalysisReason = reason
-    task.delay(0.75, function()
-        Bridge.AnalysisQueued = false
-        if Bridge.Destroyed then return end
-        if Core and type(Core.RefreshAnalysis) == "function" then
-            pcall(Core.RefreshAnalysis)
-            Bridge.Changed:Fire("Analysis", reason or "replica change")
-        end
-    end)
-end
+local function onReplicaSet(replicaId, path, value)
+    local leaf, _, inUnit, inHotbar = pathInfo(path)
+    if not leaf then return end
 
-local YEN_NAMES = {yen=true, currentyen=true, money=true, cash=true, currency=true}
-local WAVE_NAMES = {wave=true, currentwave=true, wavenumber=true, round=true, currentround=true}
-local TEAM_TOKENS = {"unitdata", "hotbardata", "trait", "equipment", "statpotential", "level", "equipped", "hotbarslot"}
-
-local function inspectScalarByName(name, value, source)
-    local n = norm(name)
-    if YEN_NAMES[n] then setYen(value, source .. "." .. tostring(name)) end
-    if WAVE_NAMES[n] then setWave(value, source .. "." .. tostring(name)) end
-end
-
-local function inspectValueTable(t, source, depth)
-    if type(t) ~= "table" then return end
-    depth = depth or 0
-    if depth > 2 then return end
-    local seen = 0
-    for k, v in pairs(t) do
-        seen = seen + 1
-        if seen > 40 then break end
-        if type(v) == "number" then
-            inspectScalarByName(k, v, source)
-        elseif type(v) == "table" and depth < 2 then
-            inspectValueTable(v, source .. "." .. tostring(k), depth + 1)
-        end
-    end
-end
-
-local function onReplicaEvent(remoteName, ...)
-    local args = table.pack(...)
-    local possiblePath = nil
-    local value = nil
-
-    -- Common ReplicaSet signature observed in this game:
-    -- (replicaId, pathTable, value)
-    if type(args[2]) == "table" then
-        possiblePath = args[2]
-        value = args[3]
-    elseif type(args[1]) == "table" then
-        possiblePath = args[1]
-        value = args[2]
+    -- Scalar runtime cache: exact leaf only, O(1).
+    if type(value) == "number" then
+        if YEN[leaf] then setYen(value, "ReplicaSet." .. leaf)
+        elseif WAVE[leaf] then setWave(value, "ReplicaSet." .. leaf) end
     end
 
-    if possiblePath then
-        local tokens = pathTokens(possiblePath)
-        local leaf = tokens[#tokens]
-        if leaf and type(value) == "number" then
-            inspectScalarByName(leaf, value, "Replica." .. remoteName)
-        elseif type(value) == "table" then
-            inspectValueTable(value, "Replica." .. remoteName, 0)
-        end
-        if tokenMatches(tokens, TEAM_TOKENS) then
-            queueAnalysis("Replica " .. remoteName .. " changed " .. table.concat(tokens, "."))
-        end
-    else
-        -- ReplicaSetValues and other compact variants: only shallow inspect args.
-        for i = 1, math.min(args.n, 4) do
-            local a = args[i]
-            if type(a) == "table" then
-                inspectValueTable(a, "Replica." .. remoteName .. ".arg" .. tostring(i), 0)
-            end
-        end
+    -- Team changes only count inside UnitData/HotbarData.
+    -- Generic Level changes elsewhere in the game are ignored.
+    if (inUnit or inHotbar) and TEAM_LEAF[leaf] then
+        markTeamDirty("ReplicaSet:" .. leaf)
+    elseif leaf == "unitdata" or leaf == "hotbardata" then
+        markTeamDirty("ReplicaSet:" .. leaf)
     end
 end
 
 local RemoteEvents = RS:FindFirstChild("RemoteEvents")
 if RemoteEvents then
-    for _, name in ipairs({"ReplicaSet", "ReplicaSetValues"}) do
-        local r = RemoteEvents:FindFirstChild(name)
-        if r and r:IsA("RemoteEvent") then
-            addConnection(r.OnClientEvent:Connect(function(...)
-                onReplicaEvent(name, ...)
-            end))
-        end
+    local replicaSet = RemoteEvents:FindFirstChild("ReplicaSet")
+    if replicaSet and replicaSet:IsA("RemoteEvent") then
+        connect(replicaSet.OnClientEvent:Connect(onReplicaSet))
     end
+    -- Intentionally do NOT inspect ReplicaSetValues. It can be very high-frequency
+    -- and its payload shape is not needed for the lightweight cache.
 end
 
--- Attribute listeners: extremely cheap and only bind to already-exposed fields.
-for _, name in ipairs({"Yen","CurrentYen","Money","Cash","Wave","CurrentWave","WaveNumber","Round"}) do
-    if LP:GetAttribute(name) ~= nil then
-        inspectScalarByName(name, LP:GetAttribute(name), "PlayerAttribute")
-        addConnection(LP:GetAttributeChangedSignal(name):Connect(function()
-            inspectScalarByName(name, LP:GetAttribute(name), "PlayerAttribute")
+-- Cheap Player attribute listeners when the game exposes exact scalar values.
+for _,name in ipairs({"Yen","CurrentYen","Money","Cash","Wave","CurrentWave","WaveNumber","Round"}) do
+    local current = LP:GetAttribute(name)
+    if current ~= nil then
+        if YEN[norm(name)] then setYen(current, "PlayerAttribute."..name) end
+        if WAVE[norm(name)] then setWave(current, "PlayerAttribute."..name) end
+        connect(LP:GetAttributeChangedSignal(name):Connect(function()
+            local v = LP:GetAttribute(name)
+            if YEN[norm(name)] then setYen(v, "PlayerAttribute."..name) end
+            if WAVE[norm(name)] then setWave(v, "PlayerAttribute."..name) end
         end))
     end
 end
 
--- One-time GUI/value discovery, then Changed listeners only. No recurring traversal.
+-- One-time fallback discovery for exact Yen/Wave UI labels.
+-- Bind at most 8 labels; after binding, there is no traversal again.
 local function numericText(s)
     if type(s) ~= "string" then return nil end
-    local cleaned = s:gsub("[,¥$%s]", "")
-    return tonumber(cleaned:match("[-+]?%d+%.?%d*"))
+    return tonumber((s:gsub("[,¥$%s]", "")):match("[-+]?%d+%.?%d*"))
 end
 
 local pg = LP:FindFirstChild("PlayerGui")
 if pg then
     local bound = 0
-    for _, d in ipairs(pg:GetDescendants()) do
-        if bound >= 40 then break end
-        local context = norm(d.Name .. " " .. (d.Parent and d.Parent.Name or ""))
-        local isYen = context:find("yen",1,true) or context:find("money",1,true) or context:find("cash",1,true) or context:find("currency",1,true)
-        local isWave = context:find("wave",1,true) or context:find("round",1,true)
-        if isYen or isWave then
-            if d:IsA("IntValue") or d:IsA("NumberValue") then
+    for _,d in ipairs(pg:GetDescendants()) do
+        if bound >= 8 then break end
+        if d:IsA("TextLabel") or d:IsA("TextBox") then
+            local context = norm(d.Name .. " " .. (d.Parent and d.Parent.Name or ""))
+            local kind
+            if context == "yen" or context:find("yendisplay",1,true) or context:find("currencylabel",1,true) then
+                kind = "Yen"
+            elseif context == "wave" or context:find("wavelabel",1,true) or context:find("wavedisplay",1,true) then
+                kind = "Wave"
+            end
+            if kind then
                 bound = bound + 1
-                if isYen then setYen(d.Value, "ValueObject:" .. d:GetFullName()) end
-                if isWave then setWave(d.Value, "ValueObject:" .. d:GetFullName()) end
-                addConnection(d.Changed:Connect(function(v)
-                    if isYen then setYen(v, "ValueObject:" .. d:GetFullName()) end
-                    if isWave then setWave(v, "ValueObject:" .. d:GetFullName()) end
-                end))
-            elseif d:IsA("TextLabel") or d:IsA("TextBox") then
-                bound = bound + 1
-                local function readText()
+                local function read()
                     local v = numericText(d.Text)
-                    if isYen then setYen(v, "GuiText:" .. d:GetFullName()) end
-                    if isWave then setWave(v, "GuiText:" .. d:GetFullName()) end
+                    if kind == "Yen" then setYen(v, "Gui."..d:GetFullName())
+                    else setWave(v, "Gui."..d:GetFullName()) end
                 end
-                readText()
-                addConnection(d:GetPropertyChangedSignal("Text"):Connect(readText))
+                read()
+                connect(d:GetPropertyChangedSignal("Text"):Connect(read))
             end
         end
     end
@@ -232,18 +185,24 @@ function Bridge.GetSnapshot()
         Wave = Bridge.Wave,
         YenSource = Bridge.YenSource,
         WaveSource = Bridge.WaveSource,
-        LastAnalysisReason = Bridge.LastAnalysisReason,
+        TeamDirty = Bridge.TeamDirty,
+        TeamDirtyReason = Bridge.TeamDirtyReason,
     }
+end
+
+function Bridge.ClearTeamDirty()
+    Bridge.TeamDirty = false
+    Bridge.TeamDirtyReason = nil
 end
 
 function Bridge.Destroy()
     if Bridge.Destroyed then return end
     Bridge.Destroyed = true
-    for _, c in ipairs(Bridge.Connections) do pcall(function() c:Disconnect() end) end
+    for _,c in ipairs(Bridge.Connections) do pcall(function() c:Disconnect() end) end
     Bridge.Connections = {}
     pcall(function() Bridge.Changed:Destroy() end)
-    if Core and Core.RuntimeBridge == Bridge then Core.RuntimeBridge = nil end
+    if Core.RuntimeBridge == Bridge then Core.RuntimeBridge = nil end
     if ENV.AE_STRATEGIST_RUNTIME == Bridge then ENV.AE_STRATEGIST_RUNTIME = nil end
 end
 
-print("[AE RuntimeBridge] READY | event-driven, no polling")
+print("[AE RuntimeBridge] READY | ultra-light | auto analysis OFF")
