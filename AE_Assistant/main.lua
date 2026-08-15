@@ -28,7 +28,7 @@
     gameplay remotes.
 ]]
 
-local VERSION = "2.0.0-evidence-alpha"
+local VERSION = "2.0.1-scanfix"
 local EXPECTED_PLACE_ID = 84515722934860
 local RAW_ROOT = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/AE_DB/"
 
@@ -946,67 +946,138 @@ local function callProfileProvider(provider, source, candidates)
     end
 end
 
-local function scanOwnedProfile()
-    local candidates = {}
+local function scanOwnedProfile(progress)
+    progress = progress or function() end
 
-    if ActionsRoot then
-        local provider = safeRequire(ActionsRoot:FindFirstChild("FetchProfileData"))
-        callProfileProvider(provider, "FusionPackage.Actions.FetchProfileData", candidates)
-    end
-
-    if Shared then
-        local replicaClient = safeRequire(Shared:FindFirstChild("ReplicaClient"))
-        callProfileProvider(replicaClient, "Shared.ReplicaClient", candidates)
-    end
-
-    -- Structural getgc fallback. Only tables that validate as owned-unit profile
-    -- structures are accepted; arbitrary tables are not used.
-    if #candidates == 0 and type(getgc) == "function" then
-        local ok, objects = pcall(getgc, true)
-        if ok and type(objects) == "table" then
-            local inspected = 0
-            for _, object in ipairs(objects) do
-                if type(object) == "table" then
-                    local score, root, owned, hotbar = scoreProfileCandidate(object)
-                    if score >= 18 and #owned > 0 then
-                        candidates[#candidates + 1] = {
-                            Score = score,
-                            Root = root,
-                            Owned = owned,
-                            Hotbar = hotbar,
-                            Source = "getgc structural match",
-                        }
-                    end
-                end
-                inspected = inspected + 1
-                if inspected % 2500 == 0 then
-                    task.wait()
-                end
-            end
-        end
-    end
-
-    table.sort(candidates, function(a, b)
-        if a.Score == b.Score then
-            return #a.Owned > #b.Owned
-        end
-        return a.Score > b.Score
-    end)
-
-    local best = candidates[1]
-    if not best then
+    -- IMPORTANT:
+    -- Do not call FetchProfileData / player lookup helpers here. During testing
+    -- those helpers accepted several argument shapes and invalid probes caused
+    -- the game's own "Could not find player to look up..." warnings.
+    -- We already know the client keeps the replicated profile + HotbarData in
+    -- memory, so scan those structures read-only instead.
+    if type(getgc) ~= "function" then
         return {
             Found = false,
             Source = "none",
             Owned = {},
             CurrentTeam = {},
-            Unknown = "No structurally validated profile table was found.",
+            Unknown = "getgc is unavailable; safe owned-unit scan cannot inspect replicated client tables.",
         }
     end
 
+    progress("Reading client replica tables...")
+    local ok, objects = pcall(getgc, true)
+    if not ok or type(objects) ~= "table" then
+        return {
+            Found = false,
+            Source = "none",
+            Owned = {},
+            CurrentTeam = {},
+            Unknown = "getgc failed while reading client replica tables.",
+        }
+    end
+
+    local bestOwned = {}
+    local bestRoot = nil
+    local bestPath = nil
+    local hotbarData = nil
+    local hotbarSource = nil
+    local inspected = 0
+
+    local function collectDirect(container, path)
+        if type(container) ~= "table" then
+            return {}
+        end
+        local out, seen = {}, {}
+        for key, value in pairs(container) do
+            if isOwnedUnitRecord(value) then
+                local asset = getCI(value, {"Asset", "Unit", "UnitName"})
+                local id = getCI(value, {"ID", "Id", "UUID", "Guid", "ReplicaID"}) or key
+                local unique = tostring(id) .. "|" .. tostring(asset)
+                if not seen[unique] then
+                    seen[unique] = true
+                    out[#out + 1] = {
+                        Asset = asset,
+                        ID = tostring(id),
+                        Data = value,
+                        Path = tostring(path) .. "." .. tostring(key),
+                    }
+                end
+            end
+        end
+        return out
+    end
+
+    local function considerOwned(container, path)
+        local records = collectDirect(container, path)
+        if #records > #bestOwned then
+            bestOwned = records
+            bestRoot = container
+            bestPath = path
+        end
+        return #records
+    end
+
+    -- Pass 1: inspect replica-shaped tables only. This is much faster than
+    -- recursively scoring every GC table and also finds HotbarData even when it
+    -- lives in a different replica from the player's owned-unit inventory.
+    for _, object in ipairs(objects) do
+        if type(object) == "table" then
+            local token = rawget(object, "Token")
+            local data = rawget(object, "Data")
+
+            if token == "HotbarData" and type(data) == "table" then
+                local slots = getCI(data, {"Slots"})
+                if type(slots) == "table" then
+                    hotbarData = slots
+                    hotbarSource = "getgc replica Token=HotbarData.Data.Slots"
+                end
+            end
+
+            if type(data) == "table" then
+                considerOwned(data, "Replica.Data")
+
+                -- Player profile data stores owned assets in a child table.
+                -- Search only one child level; no deep recursive crawl.
+                for key, child in pairs(data) do
+                    if type(child) == "table" then
+                        local hits = considerOwned(child, "Replica.Data." .. tostring(key))
+                        if hits > 0 and hits >= #bestOwned then
+                            bestRoot = child
+                            bestPath = "Replica.Data." .. tostring(key)
+                        end
+                    end
+                end
+            end
+
+            -- Some executors expose the data table itself rather than its
+            -- replica wrapper. A direct check is cheap and catches that case.
+            considerOwned(object, "getgc.table")
+        end
+
+        inspected += 1
+        if inspected % 4000 == 0 then
+            progress(string.format("Scanning client tables... %d / %d", inspected, #objects))
+            task.wait()
+        end
+    end
+
+    if #bestOwned == 0 then
+        return {
+            Found = false,
+            Source = "getgc replica scan",
+            Owned = {},
+            CurrentTeam = {},
+            CandidateCount = 0,
+            Unknown = "No owned-unit container matched the validated Unit record structure.",
+        }
+    end
+
+    progress(string.format("Owned inventory found: %d records. Resolving hotbar...", #bestOwned))
+
     local byID = {}
     local byAsset = {}
-    for _, record in ipairs(best.Owned) do
+    for _, record in ipairs(bestOwned) do
         byID[normalize(record.ID)] = record
         byAsset[normalize(record.Asset)] = byAsset[normalize(record.Asset)] or {}
         table.insert(byAsset[normalize(record.Asset)], record)
@@ -1015,10 +1086,10 @@ local function scanOwnedProfile()
     local currentTeam = {}
     local currentSeen = {}
     local function addCurrent(record, slot)
-        if not record or currentSeen[record.Asset] then
-            return
-        end
-        currentSeen[record.Asset] = true
+        if not record then return end
+        local identity = normalize(record.ID or record.Asset)
+        if currentSeen[identity] then return end
+        currentSeen[identity] = true
         currentTeam[#currentTeam + 1] = {
             Asset = record.Asset,
             Record = record,
@@ -1028,30 +1099,27 @@ local function scanOwnedProfile()
 
     local function resolveHotbarValue(value, slot)
         if type(value) == "table" then
-            if isOwnedUnitRecord(value) then
-                for _, record in ipairs(best.Owned) do
-                    if record.Data == value then
-                        addCurrent(record, slot)
-                        return
-                    end
-                end
-            end
-            local nested = getCI(value, {"UnitData", "Data"})
-            if type(nested) == "table" and isOwnedUnitRecord(nested) then
-                for _, record in ipairs(best.Owned) do
-                    if record.Data == nested or record.Asset == getCI(nested, {"Asset"}) then
-                        addCurrent(record, slot)
-                        return
-                    end
-                end
-            end
             local id = getCI(value, {"ID", "Id", "UnitID", "UUID"})
-            if id then
-                resolveHotbarValue(id, slot)
+            if id ~= nil then
+                local record = byID[normalize(tostring(id))]
+                if record then
+                    addCurrent(record, slot)
+                    return
+                end
+                -- Exact hotbar IDs look like Asset#guid. If inventory record ID
+                -- was normalized differently, resolve the asset prefix only as
+                -- a last structural fallback.
+                local prefix = tostring(id):match("^([^#]+)#")
+                local asset = prefix and UnitAlias[normalize(prefix)] or nil
+                if asset and byAsset[normalize(asset)] and byAsset[normalize(asset)][1] then
+                    addCurrent(byAsset[normalize(asset)][1], slot)
+                    return
+                end
             end
             local asset = getCI(value, {"Asset", "Unit", "UnitName"})
-            if asset then
-                resolveHotbarValue(asset, slot)
+            if asset and byAsset[normalize(asset)] and byAsset[normalize(asset)][1] then
+                addCurrent(byAsset[normalize(asset)][1], slot)
+                return
             end
         elseif type(value) == "string" or type(value) == "number" then
             local text = tostring(value)
@@ -1060,27 +1128,24 @@ local function scanOwnedProfile()
                 addCurrent(record, slot)
                 return
             end
-            local asset = UnitAlias[normalize(text)]
-            if not asset then
-                local prefix = text:match("^([^#]+)#")
-                asset = prefix and UnitAlias[normalize(prefix)] or nil
-            end
+            local prefix = text:match("^([^#]+)#")
+            local asset = UnitAlias[normalize(prefix or text)]
             if asset and byAsset[normalize(asset)] and byAsset[normalize(asset)][1] then
                 addCurrent(byAsset[normalize(asset)][1], slot)
             end
         end
     end
 
-    if type(best.Hotbar) == "table" then
-        for slot, value in pairs(best.Hotbar) do
+    if type(hotbarData) == "table" then
+        for slot, value in pairs(hotbarData) do
             resolveHotbarValue(value, slot)
         end
     end
 
-    for _, record in ipairs(best.Owned) do
-        if record.Data.Equipped == true then
-            local slot = getCI(record.Data, {"HotbarSlot", "Slot"})
-            addCurrent(record, slot)
+    -- Some profile versions also carry an Equipped boolean on records.
+    for _, record in ipairs(bestOwned) do
+        if getCI(record.Data, {"Equipped"}) == true then
+            addCurrent(record, getCI(record.Data, {"HotbarSlot", "Slot"}))
         end
     end
 
@@ -1088,14 +1153,16 @@ local function scanOwnedProfile()
         return a.Slot < b.Slot
     end)
 
+    progress("Owned-unit scan complete.")
     return {
         Found = true,
-        Score = best.Score,
-        Source = best.Source,
-        Root = best.Root,
-        Owned = best.Owned,
+        Score = #bestOwned + (hotbarData and 8 or 0),
+        Source = "getgc replica scan @ " .. tostring(bestPath),
+        HotbarSource = hotbarSource or "not found",
+        Root = bestRoot,
+        Owned = bestOwned,
         CurrentTeam = currentTeam,
-        CandidateCount = #candidates,
+        CandidateCount = 1,
     }
 end
 
@@ -2797,19 +2864,38 @@ local function updateOwnedParagraph(scan)
     })
 end
 
-local function scanOwnedAndBuildProfiles()
-    local scan = scanOwnedProfile()
+local CachedProfiles = nil
+local function scanOwnedAndBuildProfiles(forceRescan, progress)
+    progress = progress or function() end
+
+    if not forceRescan and State.OwnedScan and State.OwnedScan.Found and CachedProfiles and countKeys(CachedProfiles) > 0 then
+        progress("Using cached owned-unit scan.")
+        return State.OwnedScan, CachedProfiles
+    end
+
+    progress("Step 1/2: locating owned inventory + hotbar...")
+    local scan = scanOwnedProfile(progress)
     State.OwnedScan = scan
     updateOwnedParagraph(scan)
     if not scan.Found then
+        CachedProfiles = nil
         return scan, nil
     end
+
+    progress("Step 2/2: building unit profiles...")
     local bestByAsset = chooseBestOwnedByAsset(scan)
     local profiles = {}
+    local total = countKeys(bestByAsset)
+    local built = 0
     for asset, record in pairs(bestByAsset) do
         profiles[asset] = buildUnitProfile(asset, record)
-        task.wait()
+        built += 1
+        if built % 5 == 0 or built == total then
+            progress(string.format("Building unit profiles... %d / %d", built, total))
+            task.wait()
+        end
     end
+    CachedProfiles = profiles
     return scan, profiles
 end
 
@@ -2839,21 +2925,26 @@ AdvisorTab:CreateButton({
     Callback = function()
         task.spawn(function()
             StatusParagraph:Set({Title = "Status", Content = "Scanning validated profile structures..."})
-            local scan = scanOwnedAndBuildProfiles()
+            local scan = scanOwnedAndBuildProfiles(true, function(msg)
+                StatusParagraph:Set({Title = "Owned scan", Content = msg})
+            end)
             StatusParagraph:Set({
                 Title = "Owned scan",
-                Content = scan.Found and ("Found " .. tostring(#scan.Owned) .. " records via " .. tostring(scan.Source)) or tostring(scan.Unknown),
+                Content = scan.Found and ("Found " .. tostring(#scan.Owned) .. " records via " .. tostring(scan.Source) .. "\nHotbar: " .. tostring(scan.HotbarSource or "not found")) or tostring(scan.Unknown),
             })
+            notify("AE Advisor", scan.Found and ("Owned scan: " .. tostring(#scan.Owned) .. " records, hotbar " .. tostring(#(scan.CurrentTeam or {})) .. " slots") or ("Owned scan failed: " .. tostring(scan.Unknown)), 7)
         end)
     end,
 })
 
 local function analyze()
-    StatusParagraph:Set({Title = "Status", Content = "Analyzing stage, owned units and team combinations..."})
+    StatusParagraph:Set({Title = "Status", Content = "Analyze started..."})
+    notify("AE Advisor", "Analyze started — reading stage and owned team", 4)
 
     local stage = findStageRecord(State.SelectedStageOption)
     if not stage then
         StatusParagraph:Set({Title = "Error", Content = "Selected stage is not backed by an indexed stage module."})
+        notify("AE Advisor", "Select a valid stage first — no stage record is currently selected.", 8)
         return
     end
 
@@ -2895,9 +2986,14 @@ local function analyze()
     end
     RulesParagraph:Set({Title = "Restrictions / mechanics", Content = table.concat(ruleLines, "\n")})
 
-    local scan, profiles = scanOwnedAndBuildProfiles()
+    StatusParagraph:Set({Title = "Status", Content = "Stage read. Loading owned units..."})
+    local scan, profiles = scanOwnedAndBuildProfiles(false, function(msg)
+        StatusParagraph:Set({Title = "Status", Content = msg})
+    end)
     if not scan.Found or not profiles or countKeys(profiles) == 0 then
-        StatusParagraph:Set({Title = "Cannot recommend", Content = "Owned-unit profile was not structurally validated. No team recommendation was fabricated."})
+        local msg = scan.Unknown or "Owned-unit profile was not structurally validated. No team recommendation was fabricated."
+        StatusParagraph:Set({Title = "Cannot recommend", Content = msg})
+        notify("AE Advisor", "Cannot analyze owned team: " .. tostring(msg), 8)
         return
     end
 
@@ -2914,6 +3010,7 @@ local function analyze()
             Title = "Cannot compare current team",
             Content = "No hotbar was detected and the manual team override is blank. Enter your current team as comma-separated asset/display names.",
         })
+        notify("AE Advisor", "Owned units found, but HotbarData was not resolved. Use manual team override or rescan.", 8)
         return
     end
 
@@ -2994,6 +3091,7 @@ AdvisorTab:CreateButton({
             if not ok then
                 warnf("Analysis error", err)
                 StatusParagraph:Set({Title = "Analysis error", Content = tostring(err)})
+                notify("AE Advisor", "Analysis error: " .. tostring(err), 10)
             end
         end)
     end,
