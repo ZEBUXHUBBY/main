@@ -51,11 +51,18 @@ task.spawn(function()
         return
     end
 
-    -- Dashboard V2 preflight hotfix: make LearnButton an upvalue before its
-    -- callback closes over it. This patch is dashboard-only and does not touch core.
+    -- Dashboard-only preflight patches. These never modify the core.
     dashSource = dashSource:gsub(
         "local LearnButton=button%(",
         "local LearnButton\nLearnButton=button(",
+        1
+    )
+
+    -- Starting Yen is not a full-stage budget. Only replace the hidden core
+    -- budget when the stage exposes TotalYen or the runtime learner has a projection.
+    dashSource = dashSource:gsub(
+        "local autoBudget=stageTotal or learned or starting",
+        "local autoBudget=stageTotal or learned",
         1
     )
 
