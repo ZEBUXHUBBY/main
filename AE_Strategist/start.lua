@@ -32,22 +32,16 @@ pcall(function() cleanup(game:GetService("CoreGui")) end)
 pcall(function() cleanup(LP:FindFirstChild("PlayerGui")) end)
 pcall(function() if gethui then cleanup(gethui()) end end)
 
--- Destroy an older core instance cleanly before loading the fresh hidden one.
 if type(ENV.AE_STRATEGIST)=="table" and type(ENV.AE_STRATEGIST.Destroy)=="function" then pcall(ENV.AE_STRATEGIST.Destroy) end
 
 local core,err=fetch("main.lua")
 if not core then warn("[AE Tournament] core fetch failed:",err); return end
 
--- Core safety patch for getCI multi-return -> tonumber optional base.
 core=core:gsub("tonumber(%b())",function(args)
     if args:sub(1,7)=="(getCI(" then return "tonumber(("..args:sub(2,-2).."))" end
     return "tonumber"..args
 end)
-
--- Core must never become visible.
 core=core:gsub("Gui%.Parent = parentGui","Gui.Parent = parentGui\nGui.Enabled = false",1)
-
--- Remove the core's automatic startup analysis/path scan. Tournament analysis is manual only.
 core=core:gsub(
     "task%.spawn%(function%(%)\n    pcall%(runAnalysis%)\n    pcall%(function%(%) discoverPath%(%) end%)\nend%)",
     "-- startup auto-analysis disabled by Tournament-only loader",
@@ -61,6 +55,42 @@ print("[AE Tournament] hidden core ready | auto analyze disabled")
 
 local tour,tErr=fetch("tournament_only.lua")
 if not tour then warn("[AE Tournament] tournament UI fetch failed:",tErr); return end
-if not run("tournament optimizer",tour) then return end
 
-print("[AE Tournament] READY | press ANALYZE TOURNAMENT when you want a fresh snapshot")
+-- Tournament source hardening --------------------------------------------------
+-- ci() returns (value,key). Protect every tonumber(ci(...)) occurrence.
+tour=tour:gsub("tonumber(%b())",function(args)
+    if args:sub(1,4)=="(ci(" then return "tonumber(("..args:sub(2,-2).."))" end
+    return "tonumber"..args
+end)
+
+-- Stat processor probing is expensive. Probe only for the actual currently-owned
+-- copy; trait/equipment what-if simulations use explicit modifier tables only.
+tour=tour:gsub(
+    "local exact,processor=resolveExactStats%(out%.Asset,data,template%.Base%)",
+    "local exact,processor=nil,nil\n    if not traitOverride and equipOverride==nil then exact,processor=resolveExactStats(out.Asset,data,template.Base) end",
+    1
+)
+
+-- When the game processor gives U0 crit stats, preserve upgrade-specific base crit
+-- by applying only the processor's delta instead of overwriting every upgrade.
+tour=tour:gsub(
+    "if exact and exact%.CritChance~=nil and not traitOverride and equipOverride==nil then cc=exact%.CritChance else cc=nativeAdd%(cc,ccAdd,false%) end",
+    "if exact and exact.CritChance~=nil and not traitOverride and equipOverride==nil then cc=cc+(exact.CritChance-(template.Base.CritChance or 0)) else cc=nativeAdd(cc,ccAdd,false) end",
+    1
+)
+tour=tour:gsub(
+    "if exact and exact%.CritDamage~=nil and not traitOverride and equipOverride==nil then cd=exact%.CritDamage else cd=nativeAdd%(cd,cdAdd,true%) end",
+    "if exact and exact.CritDamage~=nil and not traitOverride and equipOverride==nil then cd=cd+(exact.CritDamage-(template.Base.CritDamage or 0)) else cd=nativeAdd(cd,cdAdd,true) end",
+    1
+)
+
+-- GAME UNITSTATS may already contain combat stat modifiers, but cost/farm income
+-- are separate economics. Preserve explicit Trait/Equipment Cost and Farm effects.
+tour=tour:gsub(
+    "local placement=tonumber%(out%.PlacementLimit%) or 1",
+    "if exact then\n        if tmods and tmods.Cost then costMul=costMul*(1+tmods.Cost) end\n        if tmods and tmods.Farm then farmMul=farmMul*(1+tmods.Farm) end\n        if emods and emods.Cost then costMul=costMul*(1+emods.Cost) end\n        if emods and emods.Farm then farmMul=farmMul*(1+emods.Farm) end\n    end\n    local placement=tonumber(out.PlacementLimit) or 1",
+    1
+)
+
+if not run("tournament optimizer",tour) then return end
+print("[AE Tournament] READY | manual one-shot analysis only")
