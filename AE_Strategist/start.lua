@@ -53,6 +53,14 @@ task.spawn(function()
         return
     end
 
+    -- Visual L1 hotfix: PlayerGui is a LayerCollector and has no AbsoluteSize.
+    -- Use the active camera viewport instead. Keep this patch isolated from the core.
+    visualSource = visualSource:gsub(
+        'local viewport = pg%.AbsoluteSize or Vector2%.new%(1920,1080%)',
+        'local viewport = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1920,1080)',
+        1
+    )
+
     local visualChunk, visualCompileError = loadstring(visualSource)
     if not visualChunk then
         warn("[AE Strategist] Visual addon compile failed; core remains active:", visualCompileError)
