@@ -19,10 +19,10 @@ local okLive, errLive = pcall(function()
     -- Collapse it to one return before tonumber so the key cannot be interpreted
     -- as tonumber's optional numeric base argument. Remove this shim after the
     -- source file itself is replaced with the corrected revision.
-    source = source:gsub(
-        'Speed = tonumber%%(getCI%%(info, %%{"Speed", "MoveSpeed", "WalkSpeed", "BaseSpeed"%%}%%)%%),',
-        'Speed = tonumber((getCI(info, {"Speed", "MoveSpeed", "WalkSpeed", "BaseSpeed"}))),'
-    )
+    local bad = 'Speed = tonumber(getCI(info, {"Speed", "MoveSpeed", "WalkSpeed", "BaseSpeed"})),'
+    local good = 'Speed = tonumber((getCI(info, {"Speed", "MoveSpeed", "WalkSpeed", "BaseSpeed"}))),'
+    local pattern = bad:gsub("(%W)", "%%%1")
+    source = source:gsub(pattern, good, 1)
 
     loadstring(source)()
 end)
