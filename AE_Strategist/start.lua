@@ -20,7 +20,6 @@ local function runSource(label,source)
     return true
 end
 
--- Destroy leftovers from previous visual builds even if their globals were lost.
 if type(ENV.AE_STRATEGIST_VISUAL)=="table" and type(ENV.AE_STRATEGIST_VISUAL.Destroy)=="function" then pcall(ENV.AE_STRATEGIST_VISUAL.Destroy) end
 if type(ENV.AE_STRATEGIST_DASHBOARD)=="table" and type(ENV.AE_STRATEGIST_DASHBOARD.Destroy)=="function" then pcall(ENV.AE_STRATEGIST_DASHBOARD.Destroy) end
 local function cleanupGui(root)
@@ -33,7 +32,7 @@ pcall(function() cleanupGui(game:GetService("CoreGui")) end)
 pcall(function() cleanupGui(LP:FindFirstChild("PlayerGui")) end)
 pcall(function() if gethui then cleanupGui(gethui()) end end)
 
--- 1) Stable core. Patch it to start hidden BEFORE it is parented/rendered.
+-- 1) Stable core, hidden before first render.
 local coreSource,err=fetch("main.lua")
 if not coreSource then warn("[AE Strategist] core fetch failed:",err); return end
 coreSource=coreSource:gsub("tonumber(%b())",function(args)
@@ -52,11 +51,18 @@ print("[AE Strategist] hidden stable core loaded")
 -- 2) Owned-copy stat engine.
 local statSource,statErr=fetch("owned_stats.lua")
 if statSource then
-    -- ci() also returns (value, matchedKey); collapse to one value inside tonumber.
     statSource=statSource:gsub("tonumber(%b())",function(args)
         if args:sub(1,4)=="(ci(" then return "tonumber(("..args:sub(2,-2).."))" end
         return "tonumber"..args
     end)
+    -- Unit DB stores CritDamage as 100-style percent while traits store +0.35.
+    -- Normalize additive trait/equipment crit values to the unit's native scale.
+    statSource=statSource:gsub(
+        "if exact and exact%.CritChance~=nil then cc=exact%.CritChance else cc=cc%+ccAdd end",
+        "if exact and exact.CritChance~=nil then cc=exact.CritChance else cc=cc+((cc>1) and ccAdd*100 or ccAdd) end",1)
+    statSource=statSource:gsub(
+        "if exact and exact%.CritDamage~=nil then cd=exact%.CritDamage else cd=cd%+cdAdd end",
+        "if exact and exact.CritDamage~=nil then cd=exact.CritDamage else cd=cd+((cd>5) and cdAdd*100 or cdAdd) end",1)
     if not runSource("owned stats",statSource) then warn("[AE Strategist] owned stats unavailable; lower-confidence fallback only") end
 else
     warn("[AE Strategist] owned stats fetch failed:",statErr)
@@ -68,7 +74,6 @@ task.spawn(function()
     local dashSource,dashErr=fetch("dashboard_v2.lua")
     if not dashSource then warn("[AE Strategist] dashboard fetch failed:",dashErr); return end
 
-    -- Proven working V2 preflight fixes.
     dashSource=dashSource:gsub("local LearnButton=button%(","local LearnButton\nLearnButton=button(",1)
     dashSource=dashSource:gsub(
         "for i,obj in ipairs%(objectives%) do\n    local b = button%(TeamPage,obj,",
@@ -80,34 +85,26 @@ task.spawn(function()
         "    rebuildViewports%(state%)\n    renderTeam%(state%)",
         "    if not Dashboard.LastViewportScan or os.clock() - Dashboard.LastViewportScan > 10 then\n        rebuildViewports(state)\n        Dashboard.LastViewportScan = os.clock()\n    end\n    renderTeam(state)",1)
 
-    -- Exact equipped copies from OwnedStats, not asset-only templates.
     dashSource=dashSource:gsub(
         "local function currentTeam%(state%)\n    local out=%{%}",
         "local function currentTeam(state)\n    if state and type(state.EffectiveCurrentTeam) == 'table' and #state.EffectiveCurrentTeam > 0 then return state.EffectiveCurrentTeam end\n    local out={}",1)
 
-    -- Truthful recommendation label. Tournament is explicitly NOT score-verified yet.
     dashSource=dashSource:gsub(
         "local function renderTeam%(state%)\n",
         "local function renderTeam(state)\n    RecTitle.Text = state.RecommendationWarning or 'RECOMMENDED OWNED COPIES'\n",1)
 
-    -- Visual cards show Level + Trait + Equipment + effective DPS.
     dashSource=dashSource:gsub("f%.Size = UDim2%.fromOffset%(118,136%)","f.Size = UDim2.fromOffset(118,148)",1)
     dashSource=dashSource:gsub(
         "local stat = text%(f,tostring%(p and p%.Element or \"%?\"%)%.%.\"  •  \"%.%.fmt%(dps,0%)%.%.\" DPS\",UDim2%.fromOffset%(6,117%),UDim2%.new%(1,-12,0,14%),false%)",
         "local meta1='Lv'..tostring(p and p.OwnedLevel or '?')..' • '..tostring(p and p.OwnedTrait or 'No Trait')\n    local meta2=tostring(p and p.EquipmentLabel or 'No Equip')..' • '..fmt(dps,0)..' DPS'\n    local stat=text(f,meta1..'\\n'..meta2,UDim2.fromOffset(6,113),UDim2.new(1,-12,0,31),false)\n    stat.TextWrapped=true",1)
 
-    -- Stat fidelity visible at a glance.
     dashSource=dashSource:gsub(
         "StageLabel%.Text=st and %(tostring%(st%.Gamemode%)%.%.\"  •  \"%.%.tostring%(st%.MapName%)%.%.\"  •  \"%.%.tostring%(st%.ActName%)%.%.\"  •  \"%.%.tostring%(st%.Difficulty%)%) or \"stage not detected\"",
         "local fidelity=state.StatFidelity\n    local fidelityText=fidelity and ('  •  stats '..tostring(fidelity.Exact or 0)..' exact / '..tostring(fidelity.Partial or 0)..' partial') or ''\n    StageLabel.Text=(st and (tostring(st.Gamemode)..'  •  '..tostring(st.MapName)..'  •  '..tostring(st.ActName)..'  •  '..tostring(st.Difficulty)) or 'stage not detected')..fidelityText",1)
 
     if not runSource("dashboard",dashSource) then return end
-
     local D=ENV.AE_STRATEGIST_DASHBOARD
     if Core and Core.Gui then pcall(function() Core.Gui.Enabled=false end) end
-    -- Remove the old-core toggle: there is only one visible UI now.
-    if D and D.Gui then
-        for _,x in ipairs(D.Gui:GetDescendants()) do if x:IsA("TextButton") and x.Text=="CORE" then x:Destroy() end end
-    end
+    if D and D.Gui then for _,x in ipairs(D.Gui:GetDescendants()) do if x:IsA("TextButton") and x.Text=="CORE" then x:Destroy() end end end
     print("[AE Strategist] single Dashboard UI loaded with owned-copy stats")
 end)
