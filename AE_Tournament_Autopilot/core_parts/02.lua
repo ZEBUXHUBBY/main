@@ -36,6 +36,42 @@
         return type(unitData) == "table" or type(hotbarData) == "table", data
     end
 
+    local function profilePlayerAffinity(object)
+        if type(object) ~= "table" then return 0 end
+        local score = 0
+        local inspected = 0
+
+        local function inspectValue(value)
+            if value == LocalPlayer then return 10000 end
+            if typeof(value) == "Instance" then
+                if value:IsA("Player") and value.UserId == LocalPlayer.UserId then return 10000 end
+                return 0
+            end
+            if type(value) == "number" and value == LocalPlayer.UserId then return 1200 end
+            if type(value) == "string" then
+                if value == LocalPlayer.Name then return 1600 end
+                if value == tostring(LocalPlayer.UserId) then return 1200 end
+            end
+            return 0
+        end
+
+        for key, value in pairs(object) do
+            inspected = inspected + 1
+            if inspected > 80 then break end
+            score = score + inspectValue(value)
+            local keyName = norm(key)
+            if type(value) == "table" and (keyName:find("replication", 1, true) or keyName:find("player", 1, true) or keyName:find("owner", 1, true)) then
+                local nested = 0
+                for _, child in pairs(value) do
+                    nested = nested + 1
+                    if nested > 24 then break end
+                    score = score + inspectValue(child)
+                end
+            end
+        end
+        return score
+    end
+
     local function scanProfileData()
         if type(getgc) ~= "function" then
             appendDiagnostic("getgc unavailable")
@@ -56,7 +92,7 @@
                 if shaped and type(data) == "table" then
                     local unitData = ci(data, {"UnitData", "Units"})
                     local hotbarData = ci(data, {"HotbarData", "Hotbar"})
-                    local score = 0
+                    local score = profilePlayerAffinity(object)
                     if type(unitData) == "table" then score = score + math.min(500, countKeys(unitData)) * 4 end
                     if type(hotbarData) == "table" then score = score + math.min(20, countKeys(hotbarData)) * 10 end
                     if ci(data, {"ProfileData"}) ~= nil then score = score + 25 end
