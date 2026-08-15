@@ -28,7 +28,7 @@
     gameplay remotes.
 ]]
 
-local VERSION = "2.0.1-scanfix"
+local VERSION = "2.0.2-windui"
 local EXPECTED_PLACE_ID = 84515722934860
 local RAW_ROOT = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/AE_DB/"
 
@@ -2682,15 +2682,238 @@ local State = {
     SelectedUnit = UnitNames[1],
 }
 
-local okRayfield, Rayfield = pcall(function()
-    return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+-- ============================================================
+-- WindUI compatibility layer
+-- Keeps the advisor logic unchanged while rendering every control with WindUI.
+-- Official WindUI dist entrypoint:
+-- https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua
+-- ============================================================
+
+local cloneref = (cloneref or clonereference or function(instance)
+    return instance
 end)
-if not okRayfield then
-    notify("AE Assistant", "Rayfield failed to load", 8)
-    warnf("Rayfield failed", Rayfield)
-    ENV.AE_ASSISTANT_LOADED = nil
-    return
+local RunService = cloneref(game:GetService("RunService"))
+local WindReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+
+local WindUI
+do
+    local ok, result = pcall(function()
+        return require("./src/Init")
+    end)
+
+    if ok then
+        WindUI = result
+    else
+        local loaded, value = pcall(function()
+            if RunService:IsStudio() or not writefile then
+                return require(WindReplicatedStorage:WaitForChild("WindUI"):WaitForChild("Init"))
+            end
+            return loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+        end)
+        if loaded then
+            WindUI = value
+        else
+            notify("AE Assistant", "WindUI failed to load", 8)
+            warnf("WindUI failed", value)
+            ENV.AE_ASSISTANT_LOADED = nil
+            return
+        end
+    end
 end
+
+App.WindUI = WindUI
+
+local function windSet(element, data)
+    if not element then return false end
+    if type(element.Set) == "function" then
+        local ok = pcall(function() element:Set(data) end)
+        if ok then return true end
+    end
+    -- Older/newer WindUI builds have occasionally used Description instead of Desc.
+    if type(data) == "table" and data.Desc ~= nil and type(element.Set) == "function" then
+        local alternate = {}
+        for k, v in pairs(data) do alternate[k] = v end
+        alternate.Description = alternate.Desc
+        alternate.Desc = nil
+        local ok = pcall(function() element:Set(alternate) end)
+        if ok then return true end
+    end
+    return false
+end
+
+local function wrapParagraph(element)
+    return {
+        _Element = element,
+        Set = function(self, config)
+            config = config or {}
+            windSet(self._Element, {
+                Title = config.Title or "",
+                Desc = config.Content or config.Desc or "",
+            })
+        end,
+    }
+end
+
+local function windDropdownValue(value)
+    if type(value) == "table" then
+        if value.Title ~= nil then return value.Title end
+        if value.Value ~= nil then return value.Value end
+        if value[1] ~= nil and #value == 1 then return windDropdownValue(value[1]) end
+    end
+    return value
+end
+
+local function wrapWindTab(tab)
+    local wrapper = {_Tab = tab}
+
+    function wrapper:CreateParagraph(config)
+        config = config or {}
+        local element = self._Tab:Paragraph({
+            Title = config.Title or "",
+            Desc = config.Content or config.Desc or "",
+        })
+        return wrapParagraph(element)
+    end
+
+    function wrapper:CreateDropdown(config)
+        config = config or {}
+        local current = config.CurrentOption
+        if type(current) == "table" then current = current[1] end
+        return self._Tab:Dropdown({
+            Title = config.Name or config.Title or "Dropdown",
+            Desc = config.Description,
+            Values = config.Options or config.Values or {},
+            Value = current,
+            Multi = config.MultipleOptions == true,
+            AllowNone = false,
+            Flag = config.Flag,
+            Callback = function(value)
+                if type(config.Callback) ~= "function" then return end
+                if config.MultipleOptions then
+                    local out = {}
+                    if type(value) == "table" then
+                        for _, item in ipairs(value) do
+                            out[#out + 1] = windDropdownValue(item)
+                        end
+                    elseif value ~= nil then
+                        out[1] = windDropdownValue(value)
+                    end
+                    config.Callback(out)
+                else
+                    config.Callback({windDropdownValue(value)})
+                end
+            end,
+        })
+    end
+
+    function wrapper:CreateInput(config)
+        config = config or {}
+        return self._Tab:Input({
+            Title = config.Name or config.Title or "Input",
+            Desc = config.Description,
+            Value = config.CurrentValue or config.Value or "",
+            Placeholder = config.PlaceholderText or config.Placeholder or "",
+            Type = "Input",
+            Flag = config.Flag,
+            Callback = config.Callback,
+        })
+    end
+
+    function wrapper:CreateSlider(config)
+        config = config or {}
+        local range = config.Range or {0, 100}
+        return self._Tab:Slider({
+            Title = config.Name or config.Title or "Slider",
+            Desc = config.Description,
+            Step = config.Increment or config.Step or 1,
+            IsTooltip = true,
+            Value = {
+                Min = tonumber(range[1]) or 0,
+                Max = tonumber(range[2]) or 100,
+                Default = tonumber(config.CurrentValue) or tonumber(config.Value) or 0,
+            },
+            Flag = config.Flag,
+            Callback = config.Callback,
+        })
+    end
+
+    function wrapper:CreateButton(config)
+        config = config or {}
+        return self._Tab:Button({
+            Title = config.Name or config.Title or "Button",
+            Desc = config.Description,
+            Icon = config.Icon or "",
+            Justify = config.Justify or "Center",
+            Callback = config.Callback,
+        })
+    end
+
+    return wrapper
+end
+
+-- Minimal Rayfield-shaped adapter so the analysis engine below does not need to be
+-- rewritten. Rendering is 100% WindUI.
+local Rayfield = {
+    _Window = nil,
+}
+
+function Rayfield:CreateWindow(config)
+    config = config or {}
+    local rawWindow = WindUI:CreateWindow({
+        Title = config.Name or "Anime Expeditions | Evidence Advisor",
+        Author = "Evidence-based team advisor",
+        Icon = "search",
+        Theme = "Dark",
+        Folder = "AE_EvidenceAdvisor",
+        ToggleKey = Enum.KeyCode.K,
+        Size = UDim2.fromOffset(690, 540),
+        Resizable = true,
+        SideBarWidth = 220,
+        HideSearchBar = false,
+        ScrollBarEnabled = true,
+        NewElements = true,
+    })
+    self._Window = rawWindow
+
+    pcall(function()
+        rawWindow:Tag({
+            Title = VERSION,
+            Icon = "github",
+            Color = "ElementBackground",
+            Border = true,
+        })
+    end)
+
+    local wrapper = {_Window = rawWindow}
+    function wrapper:CreateTab(name, icon)
+        local iconName = "circle"
+        local n = normalize(name)
+        if n:find("team", 1, true) then iconName = "users" end
+        if n:find("stage", 1, true) then iconName = "map" end
+        if n:find("owned", 1, true) then iconName = "boxes" end
+        if n:find("unit", 1, true) then iconName = "scan-search" end
+        if n:find("evidence", 1, true) or n:find("unknown", 1, true) then iconName = "badge-info" end
+        local rawTab = self._Window:Tab({
+            Title = tostring(name),
+            Icon = iconName,
+        })
+        return wrapWindTab(rawTab)
+    end
+    return wrapper
+end
+
+function Rayfield:LoadConfiguration()
+    -- WindUI uses its own ConfigManager. Flags are still passed into elements,
+    -- but V2 does not auto-load a config to avoid stale values during analysis.
+    return true
+end
+
+function Rayfield:Destroy()
+    if self._Window and type(self._Window.Destroy) == "function" then
+        pcall(function() self._Window:Destroy() end)
+    end
+end
+
 App.Rayfield = Rayfield
 
 local Window = Rayfield:CreateWindow({
@@ -3225,5 +3448,5 @@ pcall(function()
 end)
 
 showUnit(State.SelectedUnit)
-notify("AE Evidence Advisor V2", "Loaded. Select stage, set budget, then Analyze. K = hide/show.", 8)
+notify("AE Evidence Advisor V2 | WindUI", "Loaded. Select stage, set budget, then Analyze. K = hide/show.", 8)
 printf("READY", VERSION, "PlaceId", game.PlaceId, game.PlaceId == EXPECTED_PLACE_ID and "expected" or "different place")
