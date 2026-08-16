@@ -1,273 +1,421 @@
--- Beeconomy Rayfield Automation
--- Built from observed Beeconomy mapper signatures. Unknown actions are not guessed.
+-- Beeconomy Event-Based Auto Learner (Rayfield)
+-- Learns current-session action signatures from normal gameplay.
+-- It observes outgoing remotes + local input/state changes and DOES NOT replay unknown remotes.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local LP = Players.LocalPlayer
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
 
-if game.PlaceId ~= 101558830312092 then
-    warn("[Beeconomy] Unexpected place:", game.PlaceId)
+local LP = Players.LocalPlayer
+local PLACE_ID = 101558830312092
+
+if game.PlaceId ~= PLACE_ID then
+    warn("[Beeconomy Learner] Unexpected place:", game.PlaceId)
 end
 
 local CFG = {
-    Farm = false,
-    Mobs = false,
-    Fishing = false,
-    QuestAssist = false,
-    AutoHourly = false,
-    Field = "Dandelion",
-    Gap = 0.45,
+    Enabled = true,
+    CorrelationWindow = 1.25,
+    MaxEvents = 1200,
+    AutoExport = false,
+    ExportEvery = 60,
+    Verbose = false,
 }
 
-local lastAction = 0
-local function log(...) print("[Beeconomy]", ...) end
-local function ready()
-    if os.clock() - lastAction < CFG.Gap then return false end
-    lastAction = os.clock()
-    return true
-end
-
-local Details = ReplicatedStorage:WaitForChild("Core"):WaitForChild("Details")
-local EventRemote = Details:WaitForChild("e_7d9a2f31")
-local FunctionRemote = Details:WaitForChild("f_4c81b6e2")
-
-local SESSION_KEY = "7babad1b53c84bffb74659a0cb526b19"
-local HARVEST_OPCODE = 3637647479 -- observed repeatedly for Dandelion harvest packets
-local HOURLY_OPCODE = 4171703067 -- observed hourly reward claim
-
-local function pg()
-    return LP:FindFirstChildOfClass("PlayerGui") or LP:FindFirstChild("PlayerGui")
-end
-
-local function resolve(root, path)
-    local n = root
-    for _,name in ipairs(path) do
-        n = n and n:FindFirstChild(name)
-        if not n then return nil end
-    end
-    return n
-end
-
-local function clickGui(btn)
-    if not btn or not btn:IsA("GuiButton") then return false end
-    local ok = pcall(function() btn:Activate() end)
-    if ok then return true end
-    if firesignal then
-        local ok2 = pcall(function() firesignal(btn.MouseButton1Click) end)
-        if ok2 then return true end
-    end
-    local pos = btn.AbsolutePosition + btn.AbsoluteSize/2
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(pos.X,pos.Y,0,true,game,0)
-        task.wait()
-        VirtualInputManager:SendMouseButtonEvent(pos.X,pos.Y,0,false,game,0)
-    end)
-    return true
-end
-
-local GUI = {
-    Shovel = {"MiddleGui","MenuMain","ButtonStack","Hotbar","basic_shovel"},
-    Rod = {"MiddleGui","MenuMain","ButtonStack","Hotbar","wooden_fishing_rod"},
-    Playtime = {"MiddleGui","MenuMain","LeftSideBar","ButtonGrid","PlaytimeCell","Playtime"},
-    Craft = {"MiddleGui","MenuMain","BottomDock","BottomBar","ButtonRow","Craft","IconButton"},
+local Runtime = {
+    started = os.clock(),
+    events = {},
+    learned = {},
+    lastInput = nil,
+    lastExport = 0,
+    hookInstalled = false,
 }
 
-local function clickPath(path)
-    local root = pg()
-    local b = root and resolve(root,path)
-    return clickGui(b)
+local TRACKED_ATTRS = {
+    "EquippedPickaxeId",
+    "ShovelEquipped",
+    "EquippedAxeId",
+    "EquippedTitle",
+    "EquippedNetId",
+    "EquippedFishingRodId",
+    "ActiveHoldRevision",
+    "BeeCombatTargetMobId",
+    "BeeCombatTargetFieldDb",
+    "SelectedMobId",
+    "GripHoldKind",
+}
+
+local function now()
+    return os.clock() - Runtime.started
 end
 
-local function rootPart()
-    local ch = LP.Character
-    return ch and ch:FindFirstChild("HumanoidRootPart")
+local function log(...)
+    print("[Beeconomy Learner]", ...)
 end
 
-local function currentField()
-    return LP:GetAttribute("BeeCombatTargetFieldDb") or CFG.Field
-end
-
-local function equipShovel()
-    if LP:GetAttribute("ShovelEquipped") then return true end
-    clickPath(GUI.Shovel)
-    task.wait(0.15)
-    return LP:GetAttribute("ShovelEquipped") == true
-end
-
-local function getHarvestPoints(center)
-    -- Observed packets contain 3-6 nearby Vector3 flower/ground points.
-    -- We only create local nearby points; the server remains authoritative.
-    local points = {}
-    local offsets = {
-        Vector3.new(-2.0,-3.1, 1.0),
-        Vector3.new( 2.4,-3.1, 2.6),
-        Vector3.new(-2.5,-3.1,-2.2),
-        Vector3.new( 2.6,-3.1,-3.0),
-        Vector3.new(-0.4,-3.1,-1.2),
-        Vector3.new( 0.8,-3.1, 0.4),
-    }
-    for _,off in ipairs(offsets) do
-        points[#points+1] = center + off
-    end
-    return points
-end
-
-local function farmOnce()
-    if not ready() then return end
-    local hrp = rootPart()
-    if not hrp then return end
-    if not equipShovel() then
-        log("Could not equip shovel")
-        return
-    end
-
-    local field = currentField()
-    local pos = hrp.Position
-    local points = getHarvestPoints(pos)
-    local ok,err = pcall(function()
-        EventRemote:FireServer(SESSION_KEY, HARVEST_OPCODE, field, pos, points)
-    end)
-    if not ok then warn("[Beeconomy] harvest failed",err) end
-end
-
-local function mobList()
-    local out = {}
-    for _,d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("ClickDetector") and d.Name == "BeeMobTargetClick" then
-            local part = d.Parent
-            local hrp = rootPart()
-            local dist = math.huge
-            if hrp and part and part:IsA("BasePart") then
-                dist = (hrp.Position-part.Position).Magnitude
+local function safe(v, depth)
+    depth = depth or 0
+    if depth > 3 then return "<deep>" end
+    local tv = typeof(v)
+    if tv == "Vector3" then
+        return {__type="Vector3", x=v.X, y=v.Y, z=v.Z}
+    elseif tv == "CFrame" then
+        return {__type="CFrame", components={v:GetComponents()}}
+    elseif tv == "Instance" then
+        return {__type="Instance", class=v.ClassName, path=v:GetFullName()}
+    elseif tv == "EnumItem" then
+        return tostring(v)
+    elseif tv == "table" then
+        local out = {}
+        local n = 0
+        for k,val in pairs(v) do
+            n += 1
+            if n > 40 then
+                out.__truncated = true
+                break
             end
-            out[#out+1] = {cd=d,dist=dist}
+            out[tostring(k)] = safe(val, depth+1)
+        end
+        return out
+    elseif tv == "string" or tv == "number" or tv == "boolean" or tv == "nil" then
+        return v
+    end
+    return tostring(v)
+end
+
+local function push(kind, data)
+    if not CFG.Enabled then return end
+    local e = {
+        t = now(),
+        kind = kind,
+        data = safe(data),
+    }
+    table.insert(Runtime.events, e)
+    while #Runtime.events > CFG.MaxEvents do
+        table.remove(Runtime.events, 1)
+    end
+    if CFG.Verbose then
+        log(kind, HttpService:JSONEncode(e.data))
+    end
+end
+
+local function getLeaderstat(name)
+    local ls = LP:FindFirstChild("leaderstats")
+    local v = ls and ls:FindFirstChild(name)
+    return v and v.Value or nil
+end
+
+local function snapshot()
+    local s = {
+        Level = getLeaderstat("Level"),
+        Honey = getLeaderstat("Honey"),
+        Hatches = getLeaderstat("Hatches"),
+    }
+    for _,attr in ipairs(TRACKED_ATTRS) do
+        s[attr] = LP:GetAttribute(attr)
+    end
+    local ch = LP.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if hrp then s.Position = hrp.Position end
+    return s
+end
+
+local function classifyRemote(remotePath, method, args)
+    local tag = "unknown"
+    local a3 = args[3]
+    local a4 = args[4]
+    local a5 = args[5]
+    local field = LP:GetAttribute("BeeCombatTargetFieldDb")
+
+    if method == "InvokeServer" then
+        if a3 == "hourly" or a3 == "daily" or a3 == "weekly" then
+            tag = "reward:" .. tostring(a3)
+        elseif type(a3) == "string" and string.find(string.lower(a3), "quest", 1, true) then
+            tag = "quest"
+        end
+    elseif method == "FireServer" then
+        if type(a3) == "string" and typeof(a4) == "Vector3" and type(a5) == "table" then
+            tag = "farm"
+        elseif type(a3) == "string" and field and a3 == field then
+            tag = "farm"
+        elseif LP:GetAttribute("SelectedMobId") or LP:GetAttribute("BeeCombatTargetMobId") then
+            tag = "mob_candidate"
+        elseif LP:GetAttribute("EquippedFishingRodId") and LP:GetAttribute("GripHoldKind") == "fishing" then
+            tag = "fishing_candidate"
         end
     end
-    table.sort(out,function(a,b) return a.dist < b.dist end)
+
+    return tag
+end
+
+local function signature(remotePath, method, args)
+    local types = {}
+    for i=1,#args do
+        types[i] = typeof(args[i])
+    end
+    return table.concat({remotePath, method, tostring(#args), table.concat(types, ",")}, "|")
+end
+
+local function learnRemote(remote, method, args)
+    local path = remote:GetFullName()
+    local tag = classifyRemote(path, method, args)
+    local sig = signature(path, method, args)
+
+    local rec = Runtime.learned[sig]
+    if not rec then
+        rec = {
+            remote = path,
+            method = method,
+            argc = #args,
+            types = {},
+            count = 0,
+            tags = {},
+            samples = {},
+        }
+        for i=1,#args do rec.types[i] = typeof(args[i]) end
+        Runtime.learned[sig] = rec
+    end
+
+    rec.count += 1
+    rec.tags[tag] = (rec.tags[tag] or 0) + 1
+    if #rec.samples < 5 then
+        local sample = {}
+        for i=1,#args do sample[i] = safe(args[i]) end
+        table.insert(rec.samples, sample)
+    end
+
+    push("remote_out", {
+        remote = path,
+        method = method,
+        tag = tag,
+        signature = sig,
+        args = args,
+        state = snapshot(),
+        lastInput = Runtime.lastInput,
+    })
+end
+
+local function installNetworkObserver()
+    if Runtime.hookInstalled then return true end
+    if not hookmetamethod or not getnamecallmethod or not newcclosure then
+        warn("[Beeconomy Learner] Executor does not expose hookmetamethod/getnamecallmethod/newcclosure")
+        return false
+    end
+
+    local old
+    old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if CFG.Enabled and typeof(self) == "Instance" and (method == "FireServer" or method == "InvokeServer") then
+            local args = {...}
+            task.defer(function()
+                pcall(learnRemote, self, method, args)
+            end)
+        end
+        return old(self, ...)
+    end))
+
+    Runtime.hookInstalled = true
+    log("Network observer installed")
+    return true
+end
+
+local function watchState()
+    for _,attr in ipairs(TRACKED_ATTRS) do
+        LP:GetAttributeChangedSignal(attr):Connect(function()
+            push("state", {name=attr, value=LP:GetAttribute(attr), snapshot=snapshot()})
+        end)
+    end
+
+    local ls = LP:FindFirstChild("leaderstats") or LP:WaitForChild("leaderstats", 10)
+    if ls then
+        for _,name in ipairs({"Level","Honey","Hatches"}) do
+            local v = ls:FindFirstChild(name)
+            if v and v:IsA("ValueBase") then
+                v.Changed:Connect(function(new)
+                    push("leaderstat", {name=name, value=new, snapshot=snapshot()})
+                end)
+            end
+        end
+    end
+end
+
+local function watchInput()
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        local item = {
+            type = tostring(input.UserInputType),
+            key = tostring(input.KeyCode),
+            pos = input.Position,
+            t = now(),
+        }
+        Runtime.lastInput = item
+        push("input", item)
+    end)
+end
+
+local function recentCorrelations(seconds)
+    seconds = seconds or CFG.CorrelationWindow
+    local cutoff = now() - seconds
+    local out = {}
+    for i=#Runtime.events,1,-1 do
+        local e = Runtime.events[i]
+        if e.t < cutoff then break end
+        table.insert(out, 1, e)
+    end
     return out
 end
 
-local function clickDetector(cd)
-    if not cd then return false end
-    if fireclickdetector then
-        local ok = pcall(fireclickdetector,cd)
-        return ok
-    end
-    return false
-end
-
-local function mobOnce()
-    if not ready() then return end
-    local list = mobList()
-    if list[1] then
-        if not clickDetector(list[1].cd) then
-            log("Executor has no fireclickdetector")
+local function summarizeLearned()
+    local rows = {}
+    for sig,rec in pairs(Runtime.learned) do
+        local bestTag, bestN = "unknown", 0
+        for tag,n in pairs(rec.tags) do
+            if n > bestN then bestTag,bestN = tag,n end
         end
+        table.insert(rows, {
+            signature=sig,
+            remote=rec.remote,
+            method=rec.method,
+            argc=rec.argc,
+            types=rec.types,
+            count=rec.count,
+            bestTag=bestTag,
+            confidence=rec.count > 0 and math.floor((bestN/rec.count)*100+0.5) or 0,
+            samples=rec.samples,
+        })
     end
+    table.sort(rows, function(a,b) return a.count > b.count end)
+    return rows
 end
 
-local function fishingOnce()
-    if not ready() then return end
-    clickPath(GUI.Rod)
-    task.wait(0.1)
-    for _,d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("ClickDetector") and d.Name == "FishingWaterClick" then
-            if clickDetector(d) then return end
+local function buildReport()
+    return {
+        game = game.Name,
+        placeId = game.PlaceId,
+        generatedAt = os.time(),
+        sessionSeconds = now(),
+        state = safe(snapshot()),
+        learned = summarizeLearned(),
+        recent = recentCorrelations(5),
+    }
+end
+
+local function exportReport()
+    local report = buildReport()
+    local json = HttpService:JSONEncode(report)
+    local filename = "Beeconomy_AutoLearn_" .. tostring(os.time()) .. ".json"
+    if writefile then
+        local ok,err = pcall(writefile, filename, json)
+        if ok then
+            log("Saved", filename)
+            return filename
         end
+        warn("[Beeconomy Learner] writefile failed", err)
     end
+    print("===== BEEconomy AUTO LEARN REPORT =====")
+    print(json)
+    print("===== END REPORT =====")
+    return nil
 end
 
-local function claimHourly()
-    local ok,result = pcall(function()
-        return FunctionRemote:InvokeServer(SESSION_KEY,HOURLY_OPCODE,"hourly",1)
-    end)
-    if ok then
-        log("Hourly result", result and result.success)
-        return result
+local function printTop()
+    local rows = summarizeLearned()
+    print("===== LEARNED SIGNATURES =====")
+    for i=1,math.min(#rows,20) do
+        local r = rows[i]
+        print(string.format("[%d] %s %s argc=%d count=%d tag=%s confidence=%d%%", i, r.method, r.remote, r.argc, r.count, r.bestTag, r.confidence))
     end
-    warn("[Beeconomy] hourly failed",result)
+    print("===== END =====")
 end
 
-local function questText()
-    local root = pg()
-    local box = root and resolve(root,{"MiddleGui","QuestBox"})
-    if not box then return "" end
-    local t = {}
-    for _,d in ipairs(box:GetDescendants()) do
-        if d:IsA("TextLabel") and d.Visible and d.Text ~= "" then
-            t[#t+1] = string.lower(d.Text)
-        end
-    end
-    return table.concat(t," ")
-end
-
-local function questOnce()
-    local q = questText()
-    if q == "" then return end
-    if q:find("pollen",1,true) or q:find("honey",1,true) then
-        farmOnce()
-    elseif q:find("mob",1,true) or q:find("ladybug",1,true) or q:find("spider",1,true) or q:find("snail",1,true) or q:find("boss",1,true) then
-        mobOnce()
-    elseif q:find("fish",1,true) then
-        fishingOnce()
-    elseif q:find("craft",1,true) then
-        clickPath(GUI.Craft)
-    end
-end
+installNetworkObserver()
+watchState()
+watchInput()
+push("start", {state=snapshot()})
 
 local Rayfield = loadstring(game:HttpGet(((getgenv and getgenv().RayfieldUrl) or "https://sirius.menu/rayfield")))()
 local Window = Rayfield:CreateWindow({
-    Name = "Beeconomy Automation",
+    Name = "Beeconomy Auto Learner",
     Icon = 0,
-    LoadingTitle = "Beeconomy",
+    LoadingTitle = "Beeconomy Event Learner",
     LoadingSubtitle = "ZEBUXHUBBY",
     ConfigurationSaving = {Enabled=false},
     KeySystem = false,
 })
 
-local AutoTab = Window:CreateTab("Automation",4483362458)
-local RewardTab = Window:CreateTab("Rewards",4483362458)
+local LearnTab = Window:CreateTab("Auto Detect",4483362458)
 local DebugTab = Window:CreateTab("Debug",4483362458)
 
-AutoTab:CreateToggle({Name="Auto Farm",CurrentValue=false,Flag="BeeFarm",Callback=function(v) CFG.Farm=v end})
-AutoTab:CreateToggle({Name="Auto Mobs",CurrentValue=false,Flag="BeeMobs",Callback=function(v) CFG.Mobs=v end})
-AutoTab:CreateToggle({Name="Auto Fishing",CurrentValue=false,Flag="BeeFish",Callback=function(v) CFG.Fishing=v end})
-AutoTab:CreateToggle({Name="Quest Assist",CurrentValue=false,Flag="BeeQuest",Callback=function(v) CFG.QuestAssist=v end})
-AutoTab:CreateInput({Name="Preferred Field",CurrentValue=CFG.Field,PlaceholderText="Dandelion",RemoveTextAfterFocusLost=false,Flag="BeeField",Callback=function(v) if v and v~="" then CFG.Field=v end end})
-AutoTab:CreateSlider({Name="Action Gap",Range={0.25,2},Increment=0.05,Suffix="s",CurrentValue=CFG.Gap,Flag="BeeGap",Callback=function(v) CFG.Gap=v end})
+LearnTab:CreateToggle({
+    Name="Enable Event Learning",
+    CurrentValue=CFG.Enabled,
+    Flag="BeeLearnEnabled",
+    Callback=function(v) CFG.Enabled=v end,
+})
 
-RewardTab:CreateButton({Name="Claim Hourly Reward",Callback=claimHourly})
-RewardTab:CreateToggle({Name="Auto Hourly Claim",CurrentValue=false,Flag="BeeHourly",Callback=function(v) CFG.AutoHourly=v end})
+LearnTab:CreateSlider({
+    Name="Correlation Window",
+    Range={0.25,3},
+    Increment=0.25,
+    Suffix="s",
+    CurrentValue=CFG.CorrelationWindow,
+    Flag="BeeCorrelation",
+    Callback=function(v) CFG.CorrelationWindow=v end,
+})
 
-DebugTab:CreateButton({Name="Test Farm Once",Callback=farmOnce})
-DebugTab:CreateButton({Name="Test Nearest Mob",Callback=mobOnce})
-DebugTab:CreateButton({Name="Test Fishing Click",Callback=fishingOnce})
-DebugTab:CreateButton({Name="Print State",Callback=function()
-    print("Field",currentField())
-    print("ShovelEquipped",LP:GetAttribute("ShovelEquipped"))
-    print("GripHoldKind",LP:GetAttribute("GripHoldKind"))
-    print("ActiveHoldRevision",LP:GetAttribute("ActiveHoldRevision"))
-    print("SelectedMobId",LP:GetAttribute("SelectedMobId"))
-    print("BeeCombatTargetMobId",LP:GetAttribute("BeeCombatTargetMobId"))
+LearnTab:CreateToggle({
+    Name="Verbose Console",
+    CurrentValue=CFG.Verbose,
+    Flag="BeeVerbose",
+    Callback=function(v) CFG.Verbose=v end,
+})
+
+LearnTab:CreateToggle({
+    Name="Auto Export Every 60s",
+    CurrentValue=CFG.AutoExport,
+    Flag="BeeAutoExport",
+    Callback=function(v) CFG.AutoExport=v end,
+})
+
+LearnTab:CreateButton({Name="Print Learned Signatures",Callback=printTop})
+LearnTab:CreateButton({Name="Export Learning Report",Callback=exportReport})
+LearnTab:CreateButton({Name="Print Last 1.25s Events",Callback=function()
+    print("===== RECENT CORRELATION =====")
+    for _,e in ipairs(recentCorrelations()) do
+        print(string.format("+%.3f %s %s", e.t, e.kind, HttpService:JSONEncode(e.data)))
+    end
+    print("===== END =====")
 end})
 
-local lastHourlyTry = 0
+DebugTab:CreateButton({Name="Print Current State",Callback=function()
+    print(HttpService:JSONEncode(safe(snapshot())))
+end})
+
+DebugTab:CreateButton({Name="Count Learned Signatures",Callback=function()
+    local n=0
+    for _ in pairs(Runtime.learned) do n+=1 end
+    log("Learned signatures:",n,"events:",#Runtime.events,"hook:",Runtime.hookInstalled)
+end})
+
+DebugTab:CreateParagraph({
+    Title="How to train it",
+    Content="Just play normally. Do one action at a time (equip shovel, swing, click mob, fish, claim reward, quest). The learner watches input + state + remotes and groups signatures automatically. No old opcode is replayed.",
+})
+
 task.spawn(function()
-    while task.wait(0.15) do
-        if CFG.QuestAssist then
-            questOnce()
-        else
-            if CFG.Farm then farmOnce() end
-            if CFG.Mobs then mobOnce() end
-            if CFG.Fishing then fishingOnce() end
-        end
-        if CFG.AutoHourly and os.clock()-lastHourlyTry > 60 then
-            lastHourlyTry=os.clock()
-            claimHourly()
+    while task.wait(1) do
+        if CFG.AutoExport and now()-Runtime.lastExport >= CFG.ExportEvery then
+            Runtime.lastExport = now()
+            exportReport()
         end
     end
 end)
 
-Rayfield:Notify({Title="Beeconomy",Content="Rayfield automation loaded",Duration=4})
-log("Loaded. Direct actions enabled.")
+Rayfield:Notify({
+    Title="Beeconomy Auto Learner",
+    Content=Runtime.hookInstalled and "Event learner active. Play normally to train it." or "Loaded, but network hook is unavailable in this executor.",
+    Duration=6,
+})
+
+log("Loaded event-based learner. hookInstalled =", Runtime.hookInstalled)
