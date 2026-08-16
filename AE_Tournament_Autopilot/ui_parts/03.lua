@@ -63,19 +63,27 @@
 
     -- Drawing -----------------------------------------------------------------
 
+    -- Draw from the midpoint rather than rotating around the start point.
+    -- A small overlap hides sub-pixel gaps at waypoint turns, so the route reads
+    -- as one continuous road instead of disconnected bars.
     local function line(parent, a, b, thickness, color, transparency)
         local delta = b - a
         local length = delta.Magnitude
+        local width = thickness or 5
+        if length <= 0.01 then return nil end
+
+        local midpoint = (a + b) * 0.5
+        local overlap = math.max(2, width * 0.7)
         local object = Instance.new("Frame")
-        object.AnchorPoint = Vector2.new(0, 0.5)
-        object.Position = UDim2.fromOffset(a.X, a.Y)
-        object.Size = UDim2.fromOffset(length, thickness or 5)
+        object.AnchorPoint = Vector2.new(0.5, 0.5)
+        object.Position = UDim2.fromOffset(midpoint.X, midpoint.Y)
+        object.Size = UDim2.fromOffset(length + overlap * 2, width)
         object.Rotation = math.deg(math.atan2(delta.Y, delta.X))
         object.BackgroundColor3 = color or COLORS.Muted
         object.BackgroundTransparency = transparency or 0
         object.BorderSizePixel = 0
         object.Parent = parent
-        rounded(object, math.max(2, (thickness or 5) / 2))
+        rounded(object, math.max(2, width / 2))
         return object
     end
 
