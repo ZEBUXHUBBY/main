@@ -11,7 +11,7 @@ for _, path in ipairs(parts) do
 end
 local joined = table.concat(source,"\n")
 
--- Readability pass ------------------------------------------------------------
+-- Readability -----------------------------------------------------------------
 joined = joined:gsub('TextSize = 8, Truncate = Enum.TextTruncate.AtEnd', 'TextSize = 9, Truncate = Enum.TextTruncate.AtEnd')
 joined = joined:gsub('Bold = true, TextSize = 10, Truncate = Enum.TextTruncate.AtEnd', 'Bold = true, TextSize = 11, Truncate = Enum.TextTruncate.AtEnd')
 joined = joined:gsub('Bold = true, TextSize = 7, Align = Enum.TextXAlignment.Center', 'Bold = true, TextSize = 8, Align = Enum.TextXAlignment.Center')
@@ -20,92 +20,88 @@ joined = joined:gsub('Color = COLORS.Muted, TextSize = 8, Align = Enum.TextXAlig
 joined = joined:gsub('Color = COLORS.Muted, TextSize = 10, Wrap = true, YAlign = Enum.TextYAlignment.Top', 'Color = COLORS.Muted, TextSize = 12, Wrap = true, YAlign = Enum.TextYAlignment.Top')
 joined = joined:gsub('Bold = true, TextSize = 9, Truncate = Enum.TextTruncate.AtEnd', 'Bold = true, TextSize = 11, Truncate = Enum.TextTruncate.AtEnd')
 joined = joined:gsub('Color = COLORS.Muted, TextSize = 8,', 'Color = COLORS.Muted, TextSize = 10,')
-
 joined = joined:gsub('tostring%(copy%.Role or "DPS"%) %.%. "  •  " %.%. fmt%(copy%.CapDPS, 0%)', 'tostring(copy.Trait or "No Trait") .. "  •  " .. tostring(copy.Role or "DPS") .. "  •  " .. fmt(copy.CapDPS, 0)')
 joined = joined:gsub('copy%.DisplayName %.%. "  •  target "', 'copy.DisplayName .. "  •  " .. tostring(copy.Trait or "No Trait") .. "  •  target "')
 joined = joined:gsub('TeamSub%.Text = "Manual REFRESH only • no background scan"', 'TeamSub.Text = "Best owned copies • Trait shown may differ from current hotbar"')
 joined = joined:gsub('TeamSub%.Text = "Tap a unit to inspect placement %+ target"', 'TeamSub.Text = "Best copy from whole inventory • tap to inspect"')
 
--- Portrait resolver: score actual character models instead of taking the first
--- nested model, which is frequently an Aura/VFX/Hitbox model.
-local oldFind = [[    local function findUnitModel(asset)
-        if not UnitModels then return nil end
-        local folder = UnitModels:FindFirstChild(asset)
-        if not folder then return nil end
-        if folder:IsA("Model") then return folder end
-        for _, name in ipairs({"Model", "Shiny", "Default", "Unit"}) do
-            local model = folder:FindFirstChild(name)
-            if model and model:IsA("Model") then return model end
-        end
-        return folder:FindFirstChildWhichIsA("Model", true)
-    end]]
-local newFind = [[    local function findUnitModel(asset)
-        if not UnitModels then return nil end
-        local folder = UnitModels:FindFirstChild(asset)
-        if not folder then return nil end
-        local candidates = {}
-        if folder:IsA("Model") then candidates[#candidates+1] = folder end
-        for _, object in ipairs(folder:GetDescendants()) do
-            if object:IsA("Model") then candidates[#candidates+1] = object end
-        end
-        local best, bestScore = nil, -math.huge
-        for _, model in ipairs(candidates) do
-            local lower = model.Name:lower()
-            local score = 0
-            if lower == "model" or lower == "default" or lower == "unit" or lower == "character" then score = score + 45 end
-            if lower:find("shiny",1,true) then score = score + 8 end
-            if lower:find("vfx",1,true) or lower:find("effect",1,true) or lower:find("aura",1,true) or lower:find("hitbox",1,true) or lower:find("range",1,true) or lower:find("projectile",1,true) then score = score - 140 end
-            if model:FindFirstChildWhichIsA("Humanoid", true) then score = score + 120 end
-            if model:FindFirstChildWhichIsA("AnimationController", true) then score = score + 70 end
-            if model:FindFirstChild("Head", true) then score = score + 50 end
-            if model.PrimaryPart then score = score + 20 end
-            local parts = 0
-            for _, d in ipairs(model:GetDescendants()) do if d:IsA("BasePart") then parts = parts + 1 end end
-            score = score + math.min(parts, 30) * 3
-            if parts < 2 then score = score - 80 end
-            if score > bestScore then bestScore = score; best = model end
-        end
-        if bestScore < 20 then return nil end
-        return best
-    end]]
-local fs,fe = string.find(joined,oldFind,1,true)
-if fs then joined = string.sub(joined,1,fs-1)..newFind..string.sub(joined,fe+1) end
-
--- Strip visual effects from cloned character models before rendering portrait.
-local cloneNeedle = [[        local ok, model = pcall(function() return source:Clone() end)
-        if not ok or not model then return false end
-
-        local viewportFrame = Instance.new("ViewportFrame")]]
-local cloneReplacement = [[        local ok, model = pcall(function() return source:Clone() end)
-        if not ok or not model then return false end
-        for _, d in ipairs(model:GetDescendants()) do
-            if d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Smoke") or d:IsA("Fire") or d:IsA("Sparkles") or d:IsA("PointLight") or d:IsA("SpotLight") or d:IsA("SurfaceLight") or d:IsA("BillboardGui") or d:IsA("SurfaceGui") then
-                d:Destroy()
-            elseif d:IsA("BasePart") then
-                local n = d.Name:lower()
-                if n:find("hitbox",1,true) or n:find("range",1,true) or n:find("aura",1,true) then d.Transparency = 1 end
-            end
-        end
-
-        local viewportFrame = Instance.new("ViewportFrame")]]
-local cs,ce=string.find(joined,cloneNeedle,1,true)
-if cs then joined=string.sub(joined,1,cs-1)..cloneReplacement..string.sub(joined,ce+1) end
-
--- Never use the old hotbar/aura fallback as a unit portrait. A clean initial is
--- preferable to a false image until an exact external portrait is resolved.
+-- Game-native portrait renderer ------------------------------------------------
+-- Game UI evidence shows a shared renderer driven by:
+--   Frame @SafeViewport=true
+--     ViewportFrame
+--     ShowedModel (StringValue)
+-- We clone an existing game-owned template where possible and change ShowedModel,
+-- allowing the game's own viewport system to build WorldModel + fixed Camera.
 local oldAdd = [[    local function addUnitVisual(parent, copy, slotIndex)
-        -- Prefer the game's actual unit model. The old resolver often grabbed aura,
-        -- element or card-decoration ImageLabels from the hotbar instead of the face.
-        if modelVisual(copy.Asset, parent) then return "GAME MODEL" end
         local source = UI.Resolver.ByAsset[copy.Asset] or UI.Resolver.BySlot[slotIndex]
-        if cloneVisual(source, parent) then return "GAME UI FALLBACK" end
-        label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
+        if cloneVisual(source, parent) then return "GAME UI" end
+        if modelVisual(copy.Asset, parent) then return "GAME MODEL" end
+        local placeholder = label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
             Bold = true, TextSize = 28, Align = Enum.TextXAlignment.Center,
         })
         return "TEXT"
     end]]
-local newAdd = [[    local function addUnitVisual(parent, copy, slotIndex)
-        if modelVisual(copy.Asset, parent) then return "GAME MODEL" end
+local newAdd = [[    local function findSafeViewportTemplate()
+        for _, object in ipairs(PlayerGui:GetDescendants()) do
+            if object:IsA("GuiObject") and object:GetAttribute("SafeViewport") == true then
+                local viewport = object:FindFirstChildWhichIsA("ViewportFrame", true)
+                local showed = object:FindFirstChild("ShowedModel", true)
+                if viewport and showed and showed:IsA("StringValue") then return object end
+            end
+        end
+        return nil
+    end
+
+    local function gameNativeVisual(asset, parent)
+        local template = findSafeViewportTemplate()
+        local holder
+        if template then
+            local ok, clone = pcall(function() return template:Clone() end)
+            if ok and clone then holder = clone end
+        end
+        if not holder then
+            holder = Instance.new("Frame")
+            holder.Name = "NativeUnitViewport"
+            holder:SetAttribute("SafeViewport", true)
+            holder.BackgroundTransparency = 1
+            local viewport = Instance.new("ViewportFrame")
+            viewport.Name = "ViewportFrame"
+            viewport.BackgroundTransparency = 1
+            viewport.Size = UDim2.fromScale(1, 1)
+            viewport.Parent = holder
+            local showed = Instance.new("StringValue")
+            showed.Name = "ShowedModel"
+            showed.Parent = holder
+        end
+        holder.Name = "NativeUnitViewport"
+        holder.Position = UDim2.fromScale(0,0)
+        holder.Size = UDim2.fromScale(1,1)
+        holder.BackgroundTransparency = 1
+        holder.Visible = true
+        for _, child in ipairs(holder:GetChildren()) do
+            if child:IsA("GuiObject") and not child:IsA("ViewportFrame") then
+                child.Visible = false
+            end
+        end
+        local showed = holder:FindFirstChild("ShowedModel", true)
+        local viewport = holder:FindFirstChildWhichIsA("ViewportFrame", true)
+        if not showed or not viewport then holder:Destroy(); return false end
+        for _, child in ipairs(viewport:GetChildren()) do child:Destroy() end
+        viewport.Size = UDim2.fromScale(1,1)
+        viewport.Position = UDim2.fromScale(0,0)
+        viewport.BackgroundTransparency = 1
+        showed.Value = ""
+        holder.Parent = parent
+        task.defer(function()
+            if holder.Parent and showed.Parent then showed.Value = tostring(asset or "") end
+        end)
+        return true
+    end
+
+    local function addUnitVisual(parent, copy, slotIndex)
+        if gameNativeVisual(copy.Asset, parent) then return "GAME SAFE VIEWPORT" end
+        local source = UI.Resolver.ByAsset[copy.Asset]
+        if source and source:IsA("ViewportFrame") and cloneVisual(source, parent) then return "GAME VIEWPORT CLONE" end
         label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
             Bold = true, TextSize = 28, Align = Enum.TextXAlignment.Center,
         })
@@ -114,8 +110,33 @@ local newAdd = [[    local function addUnitVisual(parent, copy, slotIndex)
 local as,ae=string.find(joined,oldAdd,1,true)
 if as then joined=string.sub(joined,1,as-1)..newAdd..string.sub(joined,ae+1) end
 
--- True world-range rendering. toCanvas scales X and Z independently, therefore a
--- world-space circle must become an ellipse on screen when the map aspect differs.
+-- Uniform world projection -----------------------------------------------------
+-- Use one pixels-per-stud scale for both X and Z. This preserves geometry:
+-- a world-space circle remains a circle and the route gets letterboxing instead
+-- of being stretched independently on each axis.
+local oldCanvas = [[    local function toCanvas(position, bounds, size)
+        local x = 24 + ((position.X - bounds.MinX) / (bounds.MaxX - bounds.MinX)) * math.max(1, size.X - 48)
+        local y = 24 + ((position.Z - bounds.MinZ) / (bounds.MaxZ - bounds.MinZ)) * math.max(1, size.Y - 48)
+        return Vector2.new(x, y)
+    end]]
+local newCanvas = [[    local function worldCanvasScale(bounds, size)
+        local spanX = math.max(1, bounds.MaxX - bounds.MinX)
+        local spanZ = math.max(1, bounds.MaxZ - bounds.MinZ)
+        return math.min(math.max(1,size.X-48)/spanX, math.max(1,size.Y-48)/spanZ)
+    end
+
+    local function toCanvas(position, bounds, size)
+        local spanX = math.max(1, bounds.MaxX - bounds.MinX)
+        local spanZ = math.max(1, bounds.MaxZ - bounds.MinZ)
+        local scale = worldCanvasScale(bounds,size)
+        local usedX, usedY = spanX*scale, spanZ*scale
+        local originX = (size.X-usedX)*0.5
+        local originY = (size.Y-usedY)*0.5
+        return Vector2.new(originX + (position.X-bounds.MinX)*scale, originY + (position.Z-bounds.MinZ)*scale)
+    end]]
+local ts,te=string.find(joined,oldCanvas,1,true)
+if ts then joined=string.sub(joined,1,ts-1)..newCanvas..string.sub(joined,te+1) end
+
 local oldRange = [[            local point = toCanvas(spot.WorldPosition, bounds, size)
             local worldWidth = math.max(bounds.MaxX - bounds.MinX, bounds.MaxZ - bounds.MinZ)
             local diameter = clamp((spot.Range / math.max(1, worldWidth)) * math.min(size.X, size.Y) * 2, 48, 180)
@@ -125,22 +146,16 @@ local oldRange = [[            local point = toCanvas(spot.WorldPosition, bounds
             rangeCircle.Position = UDim2.fromOffset(point.X, point.Y)
             rangeCircle.Size = UDim2.fromOffset(diameter, diameter)]]
 local newRange = [[            local point = toCanvas(spot.WorldPosition, bounds, size)
-            local worldSpanX = math.max(1, bounds.MaxX - bounds.MinX)
-            local worldSpanZ = math.max(1, bounds.MaxZ - bounds.MinZ)
-            local pixelsPerStudX = math.max(1, size.X - 48) / worldSpanX
-            local pixelsPerStudZ = math.max(1, size.Y - 48) / worldSpanZ
-            local diameterX = math.max(12, spot.Range * pixelsPerStudX * 2)
-            local diameterY = math.max(12, spot.Range * pixelsPerStudZ * 2)
+            local pixelsPerStud = worldCanvasScale(bounds,size)
+            local diameter = math.max(12, (tonumber(spot.Range) or 0) * pixelsPerStud * 2)
 
             local rangeCircle = Instance.new("Frame")
             rangeCircle.AnchorPoint = Vector2.new(0.5, 0.5)
             rangeCircle.Position = UDim2.fromOffset(point.X, point.Y)
-            rangeCircle.Size = UDim2.fromOffset(diameterX, diameterY)]]
+            rangeCircle.Size = UDim2.fromOffset(diameter, diameter)]]
 local rs,re=string.find(joined,oldRange,1,true)
 if rs then joined=string.sub(joined,1,rs-1)..newRange..string.sub(joined,re+1) end
-joined = joined:gsub('rounded%(rangeCircle, diameter / 2%)','rounded(rangeCircle, math.max(diameterX, diameterY) / 2)')
 
--- Make the range value explicit next to each sweet spot for validation.
 local marker = [[            marker.AutoButtonColor = false
 
             label(MapSurface, spot.Purpose,]]
