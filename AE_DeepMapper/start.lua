@@ -9,7 +9,7 @@ local function notify(title, text)
     end)
 end
 
-notify("AE Deep Mapper", "Loading targeted Tournament discovery…")
+notify("AE Deep Mapper", "Loading Stats + Equipment discovery…")
 
 local okFetch, src = pcall(function()
     return game:HttpGet(ROOT.."mapper.lua?fresh="..nonce)
