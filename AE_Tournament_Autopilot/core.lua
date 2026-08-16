@@ -35,9 +35,7 @@ local replacement = [[    local function scanProfileData()
 joined=string.sub(joined,1,scanStart-1)..replacement..string.sub(joined,nextStart)
 end
 
--- Route discovery uses only explicit numeric ordering. It never connects arbitrary
--- decorative parts. One pass groups numbered positioned instances by their parent,
--- then chooses the strongest contiguous sequence.
+-- Route discovery uses only explicit numeric ordering.
 local pathStart=string.find(joined,"    local function discoverPath()\n",1,true)
 local pathNext=pathStart and string.find(joined,"    local function pathDistance",pathStart,true) or nil
 if pathStart and pathNext then
@@ -52,60 +50,79 @@ local strictPath=[[    local function discoverPath()
                 local parent = instance.Parent
                 if position and parent then
                     local group = groups[parent]
-                    if not group then
-                        group = {Parent=parent, ByOrder={}, Min=math.huge, Max=-math.huge, Count=0}
-                        groups[parent] = group
-                    end
-                    if not group.ByOrder[order] then
-                        group.ByOrder[order] = {Position=position,Order=order,Name=instance.Name,Instance=instance}
-                        group.Count = group.Count + 1
-                        group.Min = math.min(group.Min, order)
-                        group.Max = math.max(group.Max, order)
-                    end
+                    if not group then group={Parent=parent,ByOrder={},Min=math.huge,Max=-math.huge,Count=0};groups[parent]=group end
+                    if not group.ByOrder[order] then group.ByOrder[order]={Position=position,Order=order,Name=instance.Name,Instance=instance};group.Count+=1;group.Min=math.min(group.Min,order);group.Max=math.max(group.Max,order) end
                 end
             end
-            if scanned % 6000 == 0 then task.wait() end
+            if scanned%6000==0 then task.wait() end
         end
-
-        local best, bestScore = nil, -math.huge
-        local candidateSummaries = {}
-        for _, group in pairs(groups) do
-            if group.Count >= 5 and group.Max >= group.Min then
-                local span = group.Max - group.Min + 1
-                local contiguous = span == group.Count
-                if contiguous then
-                    local fullName = ""
-                    pcall(function() fullName = group.Parent:GetFullName() end)
-                    local lower = fullName:lower()
-                    local score = group.Count * 100
-                    if group.Min == 1 then score = score + 500 end
-                    if lower:find("path",1,true) then score = score + 450 end
-                    if lower:find("waypoint",1,true) or lower:find("route",1,true) then score = score + 350 end
-                    if lower:find("workspace.map",1,true) then score = score + 250 end
-                    if #candidateSummaries < 8 then candidateSummaries[#candidateSummaries+1] = fullName.."["..group.Min..".."..group.Max.."]" end
-                    if score > bestScore then bestScore=score;best=group end
+        local best,bestScore=nil,-math.huge;local candidateSummaries={}
+        for _,group in pairs(groups) do
+            if group.Count>=5 and group.Max>=group.Min then
+                local span=group.Max-group.Min+1
+                if span==group.Count then
+                    local fullName="";pcall(function()fullName=group.Parent:GetFullName()end);local lower=fullName:lower();local score=group.Count*100
+                    if group.Min==1 then score+=500 end;if lower:find("path",1,true) then score+=450 end;if lower:find("waypoint",1,true) or lower:find("route",1,true) then score+=350 end;if lower:find("workspace.map",1,true) then score+=250 end
+                    if #candidateSummaries<8 then candidateSummaries[#candidateSummaries+1]=fullName.."["..group.Min..".."..group.Max.."]" end
+                    if score>bestScore then bestScore=score;best=group end
                 end
             end
         end
-
-        if not best then
-            appendDiagnostic("route scan no contiguous numbered parent; candidates="..table.concat(candidateSummaries," | "))
-            return {}, "ORDERED_ROUTE_NOT_FOUND"
-        end
-
-        local points = {}
-        for order=best.Min,best.Max do
-            local point=best.ByOrder[order]
-            if not point then return {},"ORDERED_ROUTE_GAP_"..tostring(order) end
-            points[#points+1]=point
-        end
-        local parentName="unknown";pcall(function() parentName=best.Parent:GetFullName() end)
-        appendDiagnostic("route resolved parent="..parentName.." points="..#points.." orders="..best.Min..".."..best.Max)
-        return points,"VERIFIED_CONTIGUOUS_"..tostring(#points)
+        if not best then appendDiagnostic("route scan no contiguous numbered parent; candidates="..table.concat(candidateSummaries," | "));return {},"ORDERED_ROUTE_NOT_FOUND" end
+        local points={};for order=best.Min,best.Max do local point=best.ByOrder[order];if not point then return {},"ORDERED_ROUTE_GAP_"..tostring(order) end;points[#points+1]=point end
+        local parentName="unknown";pcall(function()parentName=best.Parent:GetFullName()end);appendDiagnostic("route resolved parent="..parentName.." points="..#points.." orders="..best.Min..".."..best.Max);return points,"VERIFIED_CONTIGUOUS_"..#points
     end
 
 ]]
 joined=string.sub(joined,1,pathStart-1)..strictPath..string.sub(joined,pathNext)
+end
+
+-- Sweet spots must use the effective Range at the optimizer's target upgrade,
+-- not copy.Final.Range. copy.Upgrades already contains Level/Trait/Equipment/
+-- Potential modifiers applied by applyOwnedCopy().
+local sweetStart=string.find(joined,"    local function sweetSpots(copy, points, context)\n",1,true)
+local sweetNext=sweetStart and string.find(joined,"    -- -------------------------------------------------------------------------\n    -- Live snapshot and action planner",sweetStart,true) or nil
+if sweetStart and sweetNext then
+local sweetReplacement=[[    local function sweetSpots(copy, points, context)
+        if not copy or not copy.Final or #points < 3 then return {} end
+        local targetLevel = tonumber(copy.UpgradePlan and copy.UpgradePlan.TargetLevel)
+        local rangeUpgrade = nil
+        if targetLevel ~= nil then
+            for _, upgrade in ipairs(copy.Upgrades or {}) do
+                if tonumber(upgrade.Level) == targetLevel then rangeUpgrade = upgrade; break end
+            end
+        end
+        rangeUpgrade = rangeUpgrade or copy.Base or copy.Final
+        local range = math.max(0, tonumber(rangeUpgrade and rangeUpgrade.Range) or 0)
+        if range <= 0 then return {} end
+        copy.PlacementRange = range
+        copy.PlacementRangeLevel = tonumber(rangeUpgrade.Level) or targetLevel
+
+        local candidates = {}
+        local totalLength = pathDistance(points)
+        local progress = 0
+        for index=2,#points-1 do
+            local previous=points[index-1].Position;local current=points[index].Position;local nextPoint=points[index+1].Position
+            local direction=nextPoint-previous;if direction.Magnitude>0.1 then direction=direction.Unit else direction=Vector3.new(1,0,0) end
+            local perpendicular=Vector3.new(-direction.Z,0,direction.X);local segmentLength=(current-previous).Magnitude;progress+=segmentLength
+            local offsetDistance=clamp(range*0.45,6,18)
+            for _,side in ipairs({-1,1}) do
+                local raw=current+perpendicular*offsetDistance*side;local position=groundAt(raw);local covered,total,first,last=coverageFor(position,range,points)
+                local d1=current-previous;local d2=nextPoint-current;local turn=0;if d1.Magnitude>0.1 and d2.Magnitude>0.1 then turn=1-clamp(d1.Unit:Dot(d2.Unit),-1,1) end
+                local speedFactor=context.Speedy and (1+(context.SpeedPercent or 50)/100) or 1;local exposure=covered/speedFactor;local score=exposure+turn*range*0.7;if context.BossWaves then score+=exposure*0.25 end
+                candidates[#candidates+1]={WorldPosition=position,PathCoverage=covered,TotalPath=total,CoveragePercent=total>0 and covered/total or 0,FirstCoverage=first,LastCoverage=last,Progress=totalLength>0 and progress/totalLength or 0,Score=score,Range=range,RangeLevel=copy.PlacementRangeLevel,Side=side}
+            end
+        end
+        table.sort(candidates,function(a,b)return a.Score>b.Score end)
+        local selected={}
+        for _,candidate in ipairs(candidates) do local separated=true;for _,existing in ipairs(selected) do if (candidate.WorldPosition-existing.WorldPosition).Magnitude<math.max(8,range*0.45) then separated=false;break end end;if separated then selected[#selected+1]=candidate;if #selected>=3 then break end end end
+        table.sort(selected,function(a,b)return a.Progress<b.Progress end);local labels={"A","B","C"};for index,spot in ipairs(selected) do spot.Label=labels[index] or tostring(index);spot.Purpose=index==1 and "OPENER" or (index==#selected and "CATCH / REPOSITION" or "SUSTAINED") end
+        appendDiagnostic("range "..tostring(copy.DisplayName).." U"..tostring(copy.PlacementRangeLevel or "?").." = "..string.format("%.2f",range))
+        return selected
+    end
+
+]]
+joined=string.sub(joined,1,sweetStart-1)..sweetReplacement..string.sub(joined,sweetNext)
 end
 
 local tailMarker="    return Brain\nend"
