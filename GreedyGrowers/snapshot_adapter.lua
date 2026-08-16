@@ -19,9 +19,7 @@ local function now()
 end
 
 local function parseCash(v)
-    if typeof(v) == "Instance" then
-        v = v.Value
-    end
+    if typeof(v) == "Instance" then v = v.Value end
     if type(v) == "number" then return v end
     if type(v) ~= "string" then return nil end
     local cleaned = v:gsub("[^%d%.%-]", "")
@@ -30,22 +28,18 @@ end
 
 local function findCashValue()
     if not LocalPlayer then return nil end
-
     local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
     if leaderstats then
         local cash = leaderstats:FindFirstChild("Cash")
         if cash then return cash end
     end
-
     local cash = LocalPlayer:FindFirstChild("Cash")
     if cash then return cash end
-
     return nil
 end
 
 local function describeRemote(remote)
-    local parts = {}
-    local p = remote
+    local parts, p = {}, remote
     while p and p ~= game do
         table.insert(parts, 1, p.Name)
         p = p.Parent
@@ -55,7 +49,6 @@ end
 
 function Adapter.new()
     local self = setmetatable({}, Adapter)
-
     self.Mode = "SNAPSHOT_PASSIVE"
     self.ReadOnly = true
     self.Rounds = {}
@@ -70,13 +63,14 @@ function Adapter.new()
     self.CashValue = findCashValue()
 
     self.LightningObserved, self._LightningObserved = newSignal()
+    self.LightningCandidateObserved, self._LightningCandidateObserved = newSignal()
     self.TreeUpdated, self._TreeUpdated = newSignal()
     self.SaleCompleted, self._SaleCompleted = newSignal()
     self.StateChanged, self._StateChanged = newSignal()
 
     self:_bindSnapshotEvents()
     self:_bindCash()
-
+    self:_bindCurrentWeather()
     return self
 end
 
@@ -100,6 +94,27 @@ function Adapter:_bindCash()
     end
 end
 
+function Adapter:_emitLightningCandidate(source, payload)
+    local ts = now()
+    self._LightningCandidateObserved:Fire(ts, source, payload)
+    self:_setEvent("LIGHTNING_CANDIDATE", {at=ts, source=source, payload=payload})
+end
+
+function Adapter:_bindCurrentWeather()
+    local current = ReplicatedStorage:FindFirstChild("CurrentWeather")
+    if not current then return end
+    local function emit(reason)
+        local value = tostring(current.Value or "")
+        local low = value:lower()
+        self:_setEvent("CurrentWeather", {value=value, reason=reason, endTime=current:GetAttribute("EndTime")})
+        if low:find("lightning",1,true) or low:find("storm",1,true) then
+            self:_emitLightningCandidate("CurrentWeather:"..value, {reason=reason, endTime=current:GetAttribute("EndTime")})
+        end
+    end
+    self:_rememberConnection(current:GetPropertyChangedSignal("Value"):Connect(function() emit("Value") end))
+    self:_rememberConnection(current:GetAttributeChangedSignal("EndTime"):Connect(function() emit("EndTime") end))
+end
+
 function Adapter:_onRoundStarted(roundId, position, serverTimestamp, sequence, observedNumber, seedName, extra)
     if roundId == nil then return end
     local key = tostring(roundId)
@@ -109,7 +124,6 @@ function Adapter:_onRoundStarted(roundId, position, serverTimestamp, sequence, o
     record.position = position
     record.serverTimestamp = serverTimestamp
     record.sequence = sequence
-    -- Snapshot exposes this numeric field but does not prove its semantic meaning.
     record.observedNumber = observedNumber
     record.extra = extra
     record.state = "ROUND_STARTED"
@@ -129,10 +143,12 @@ function Adapter:_onPlantStopped(roundId, observedNumber)
     record.stoppedAt = now()
     record.stopObservedNumber = observedNumber
     record.lastUpdatedAt = now()
-    -- Do not equate stopped with harvest-ready; snapshot does not prove that.
     self.Rounds[key] = record
     self:_setEvent("PlantStoppedAll", record)
     self._TreeUpdated:Fire(record)
+    if LocalPlayer and roundId == LocalPlayer.UserId then
+        self:_emitLightningCandidate("PlantStoppedAll", {roundId=roundId, observedNumber=observedNumber})
+    end
 end
 
 function Adapter:_onCrashed(roundId, observedNumber)
@@ -161,18 +177,13 @@ function Adapter:_onRoundReset(roundId)
 end
 
 function Adapter:_onSeedSpawned(data)
-    local record = {
-        raw = data,
-        observedAt = now(),
-    }
-
+    local record = { raw = data, observedAt = now() }
     if type(data) == "table" then
         record.seedKey = data.seedKey or data.SeedKey or data.seed or data.Seed or data.name or data.Name
         record.rarity = data.rarity or data.Rarity
         record.spawnId = data.spawnId or data.SpawnId or data.id or data.ID
         record.travelDuration = data.travelDuration or data.TravelDuration
     end
-
     self.SeedConveyor[#self.SeedConveyor + 1] = record
     if #self.SeedConveyor > 50 then table.remove(self.SeedConveyor, 1) end
     self:_setEvent("SeedSpawned", record)
@@ -192,7 +203,6 @@ end
 
 function Adapter:_bindRemote(remote)
     if not remote:IsA("RemoteEvent") then return false end
-
     local handlers = {
         RoundStartedAll = function(...) self:_onRoundStarted(...) end,
         PlantStoppedAll = function(...) self:_onPlantStopped(...) end,
@@ -203,13 +213,19 @@ function Adapter:_bindRemote(remote)
             self.LastSelectedItemID = id
             self:_setEvent("SelectedItemID", id)
         end,
-        DataUpdate = function(...)
-            self:_setEvent("DataUpdate", { ... })
-        end,
-        SeedGrowStarted = function(seedName)
-            self:_setEvent("SeedGrowStarted", seedName)
-        end,
+        DataUpdate = function(...) self:_setEvent("DataUpdate", { ... }) end,
+        SeedGrowStarted = function(seedName) self:_setEvent("SeedGrowStarted", seedName) end,
         Event = function(...) self:_onGenericEvent(...) end,
+        WeatherChanged = function(...)
+            local args={...}
+            self:_setEvent("WeatherChanged", args)
+            self:_emitLightningCandidate("WeatherChanged", args)
+        end,
+        LightningNegated = function(...)
+            local args={...}
+            self:_setEvent("LightningNegated", args)
+            self:_emitLightningCandidate("LightningNegated", args)
+        end,
         SendNotification = function(message, ...)
             self:_setEvent("SendNotification", message)
             if type(message) == "string" then
@@ -218,15 +234,10 @@ function Adapter:_bindRemote(remote)
             end
         end,
     }
-
     local handler = handlers[remote.Name]
     if not handler then return false end
-
-    local ok, connection = pcall(function()
-        return remote.OnClientEvent:Connect(handler)
-    end)
+    local ok, connection = pcall(function() return remote.OnClientEvent:Connect(handler) end)
     if not ok or not connection then return false end
-
     self:_rememberConnection(connection)
     self.BoundRemotes[remote.Name] = describeRemote(remote)
     return true
@@ -235,18 +246,14 @@ end
 function Adapter:_bindSnapshotEvents()
     local bound = 0
     for _, descendant in ipairs(ReplicatedStorage:GetDescendants()) do
-        if descendant:IsA("RemoteEvent") and self:_bindRemote(descendant) then
-            bound += 1
-        end
+        if descendant:IsA("RemoteEvent") and self:_bindRemote(descendant) then bound += 1 end
     end
     self.BoundCount = bound
     self:_setEvent("SNAPSHOT_BOUND", { count = bound })
 end
 
 function Adapter:GetCash()
-    if self.CashValue and self.CashValue.Parent then
-        return parseCash(self.CashValue) or 0
-    end
+    if self.CashValue and self.CashValue.Parent then return parseCash(self.CashValue) or 0 end
     self.CashValue = findCashValue()
     return parseCash(self.CashValue) or 0
 end
@@ -254,25 +261,16 @@ end
 function Adapter:GetTrees()
     local out = {}
     for _, record in pairs(self.Rounds) do
-        if record.state ~= "RESET" then
-            out[#out + 1] = record
-        end
+        if record.state ~= "RESET" then out[#out + 1] = record end
     end
-    table.sort(out, function(a, b)
-        return (a.lastUpdatedAt or 0) > (b.lastUpdatedAt or 0)
-    end)
+    table.sort(out, function(a, b) return (a.lastUpdatedAt or 0) > (b.lastUpdatedAt or 0) end)
     return out
 end
 
-function Adapter:GetInventoryCount()
-    -- Snapshot proves item selection/data updates, but not a stable inventory schema.
-    return 0
-end
+function Adapter:GetInventoryCount() return 0 end
 
 function Adapter:GetSnapshotStatus()
-    local active = 0
-    local crashed = 0
-    local stopped = 0
+    local active, crashed, stopped = 0,0,0
     for _, r in pairs(self.Rounds) do
         if r.state ~= "RESET" then active += 1 end
         if r.state == "CRASHED" then crashed += 1 end
@@ -295,11 +293,10 @@ function Adapter:GetSnapshotStatus()
 end
 
 function Adapter:Destroy()
-    for _, c in ipairs(self.Connections) do
-        pcall(function() c:Disconnect() end)
-    end
+    for _, c in ipairs(self.Connections) do pcall(function() c:Disconnect() end) end
     table.clear(self.Connections)
     pcall(function() self._LightningObserved:Destroy() end)
+    pcall(function() self._LightningCandidateObserved:Destroy() end)
     pcall(function() self._TreeUpdated:Destroy() end)
     pcall(function() self._SaleCompleted:Destroy() end)
     pcall(function() self._StateChanged:Destroy() end)
