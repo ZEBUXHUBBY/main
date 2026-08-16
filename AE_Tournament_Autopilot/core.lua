@@ -10,7 +10,6 @@ end
 local joined = table.concat(source, "\n")
 joined = joined:gsub("return value, key", "return value", 1)
 
--- validated inventory scanner
 local scanStart = string.find(joined, "    local function scanProfileData()\n", 1, true)
 local nextStart = scanStart and string.find(joined, "    local function isUnitRecord", scanStart, true) or nil
 if scanStart and nextStart then
@@ -36,27 +35,73 @@ local replacement = [[    local function scanProfileData()
 joined=string.sub(joined,1,scanStart-1)..replacement..string.sub(joined,nextStart)
 end
 
--- verified route. Probe found a descendant named Paths with numeric children 1..43.
+-- Route discovery uses only explicit numeric ordering. It never connects arbitrary
+-- decorative parts. One pass groups numbered positioned instances by their parent,
+-- then chooses the strongest contiguous sequence.
 local pathStart=string.find(joined,"    local function discoverPath()\n",1,true)
 local pathNext=pathStart and string.find(joined,"    local function pathDistance",pathStart,true) or nil
 if pathStart and pathNext then
 local strictPath=[[    local function discoverPath()
-        local map=Workspace:FindFirstChild("Map")
-        if not map then appendDiagnostic("route: Workspace.Map missing");return {},"MAP_NOT_FOUND" end
-        local pathRoot=map:FindFirstChild("Paths",true)
-        if not pathRoot then
-            local names={};for _,child in ipairs(map:GetChildren()) do if #names<18 then names[#names+1]=child.Name end end
-            appendDiagnostic("route: Paths missing; map children="..table.concat(names,","));return {},"MAP_PATHS_NOT_FOUND"
+        local groups = {}
+        local scanned = 0
+        for _, instance in ipairs(Workspace:GetDescendants()) do
+            scanned = scanned + 1
+            local order = tonumber(instance.Name)
+            if order then
+                local position = worldPosition(instance)
+                local parent = instance.Parent
+                if position and parent then
+                    local group = groups[parent]
+                    if not group then
+                        group = {Parent=parent, ByOrder={}, Min=math.huge, Max=-math.huge, Count=0}
+                        groups[parent] = group
+                    end
+                    if not group.ByOrder[order] then
+                        group.ByOrder[order] = {Position=position,Order=order,Name=instance.Name,Instance=instance}
+                        group.Count = group.Count + 1
+                        group.Min = math.min(group.Min, order)
+                        group.Max = math.max(group.Max, order)
+                    end
+                end
+            end
+            if scanned % 6000 == 0 then task.wait() end
         end
-        local indexed,maxOrder={},0;local candidateCount=0
-        for _,descendant in ipairs(pathRoot:GetDescendants()) do local order=tonumber(descendant.Name);local position=order and worldPosition(descendant) or nil;if order and position then candidateCount+=1;indexed[order]={Position=position,Order=order,Name=descendant.Name,Instance=descendant};maxOrder=math.max(maxOrder,order) end end
-        -- Some maps store numbered Parts as direct children; GetDescendants includes them,
-        -- but keep a direct-child pass for executor implementations with odd descendant behavior.
-        for _,child in ipairs(pathRoot:GetChildren()) do local order=tonumber(child.Name);local position=order and worldPosition(child) or nil;if order and position then indexed[order]={Position=position,Order=order,Name=child.Name,Instance=child};maxOrder=math.max(maxOrder,order) end end
-        appendDiagnostic("route root="..pathRoot:GetFullName().." candidates="..candidateCount.." maxOrder="..maxOrder)
-        if maxOrder<3 then return {},"MAP_PATHS_NO_ORDER" end
-        local points={};for order=1,maxOrder do if not indexed[order] then appendDiagnostic("route gap="..order);return {},"MAP_PATHS_GAP_"..order end;points[#points+1]=indexed[order] end
-        appendDiagnostic("verified path resolved="..#points);return points,"VERIFIED_MAP_PATHS_"..#points
+
+        local best, bestScore = nil, -math.huge
+        local candidateSummaries = {}
+        for _, group in pairs(groups) do
+            if group.Count >= 5 and group.Max >= group.Min then
+                local span = group.Max - group.Min + 1
+                local contiguous = span == group.Count
+                if contiguous then
+                    local fullName = ""
+                    pcall(function() fullName = group.Parent:GetFullName() end)
+                    local lower = fullName:lower()
+                    local score = group.Count * 100
+                    if group.Min == 1 then score = score + 500 end
+                    if lower:find("path",1,true) then score = score + 450 end
+                    if lower:find("waypoint",1,true) or lower:find("route",1,true) then score = score + 350 end
+                    if lower:find("workspace.map",1,true) then score = score + 250 end
+                    if #candidateSummaries < 8 then candidateSummaries[#candidateSummaries+1] = fullName.."["..group.Min..".."..group.Max.."]" end
+                    if score > bestScore then bestScore=score;best=group end
+                end
+            end
+        end
+
+        if not best then
+            appendDiagnostic("route scan no contiguous numbered parent; candidates="..table.concat(candidateSummaries," | "))
+            return {}, "ORDERED_ROUTE_NOT_FOUND"
+        end
+
+        local points = {}
+        for order=best.Min,best.Max do
+            local point=best.ByOrder[order]
+            if not point then return {},"ORDERED_ROUTE_GAP_"..tostring(order) end
+            points[#points+1]=point
+        end
+        local parentName="unknown";pcall(function() parentName=best.Parent:GetFullName() end)
+        appendDiagnostic("route resolved parent="..parentName.." points="..#points.." orders="..best.Min..".."..best.Max)
+        return points,"VERIFIED_CONTIGUOUS_"..tostring(#points)
     end
 
 ]]
