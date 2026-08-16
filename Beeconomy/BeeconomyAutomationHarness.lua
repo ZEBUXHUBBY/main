@@ -1,496 +1,185 @@
--- Beeconomy Event-Based Auto Learner V2 (Rayfield)
--- Learns current-session action episodes from normal gameplay.
--- State transitions anchor actions; repetitive unanchored traffic is treated as background.
--- Observer only: this script does not replay learned/unknown remotes.
+-- Beeconomy Semantic Auto Learner V3 (Rayfield)
+-- Observer only. Learns action/state/network correlations from normal gameplay.
+-- V3 fixes episode pollution: clicks are short/debounced, semantic state owns traffic,
+-- and farm classification requires the CURRENT shovel hold state.
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
-local HttpService = game:GetService("HttpService")
+local Players=game:GetService("Players")
+local UIS=game:GetService("UserInputService")
+local HttpService=game:GetService("HttpService")
+local LP=Players.LocalPlayer
+local PLACE_ID=101558830312092
+if game.PlaceId~=PLACE_ID then warn("[Beeconomy V3] Unexpected place",game.PlaceId) end
 
-local LP = Players.LocalPlayer
-local PLACE_ID = 101558830312092
-if game.PlaceId ~= PLACE_ID then warn("[Beeconomy Learner] Unexpected place:", game.PlaceId) end
+local CFG={Enabled=true,ClickWindow=.12,SemanticWindow=.34,ClickDebounce=.10,MaxEvents=1600,MaxEpisodes=220,AutoExport=false,ExportEvery=60,Verbose=false}
+local R={started=os.clock(),events={},episodes={},learned={},patterns={},prev={},hook=false,owner=nil,lastInput=nil,lastClick=-999,lastExport=0,nextEpisodeId=0}
 
-local CFG = {
-    Enabled = true,
-    PreWindow = 0.35,
-    PostWindow = 0.90,
-    MaxEvents = 1800,
-    MaxEpisodes = 200,
-    AutoExport = false,
-    ExportEvery = 60,
-    Verbose = false,
-    BackgroundThreshold = 8,
-}
+local ATTRS={"EquippedPickaxeId","ShovelEquipped","EquippedAxeId","EquippedTitle","EquippedNetId","EquippedFishingRodId","ActiveHoldRevision","BeeCombatTargetMobId","BeeCombatTargetFieldDb","SelectedMobId","GripHoldKind"}
+local HOTBAR={One="shovel",Two="axe",Three="pickaxe",Four="fishing",Five="net",Six="hoverboard"}
+local BG={tool=true,recieveSnapshot=true,receiveSnapshot=true,MatildasMarket=true}
 
-local Runtime = {
-    started = os.clock(),
-    events = {},
-    episodes = {},
-    learned = {},
-    patterns = {},
-    lastInput = nil,
-    lastExport = 0,
-    hookInstalled = false,
-    activeEpisode = nil,
-    previousState = {},
-}
-
-local TRACKED_ATTRS = {
-    "EquippedPickaxeId","ShovelEquipped","EquippedAxeId","EquippedTitle",
-    "EquippedNetId","EquippedFishingRodId","ActiveHoldRevision",
-    "BeeCombatTargetMobId","BeeCombatTargetFieldDb","SelectedMobId","GripHoldKind",
-}
-
-local ACTION_DRIVEN = {
-    ActiveHoldRevision=true,
-    GripHoldKind=true,
-    ShovelEquipped=true,
-}
-
-local COMBAT_PERIODIC = {
-    BeeCombatTargetMobId=true,
-    BeeCombatTargetFieldDb=true,
-    SelectedMobId=true,
-}
-
-local KNOWN_BACKGROUND_A3 = {
-    tool=true,
-    recieveSnapshot=true,
-    receiveSnapshot=true,
-    MatildasMarket=true,
-}
-
-local HOTBAR_KIND = {
-    One="shovel", Two="axe", Three="pickaxe", Four="fishing", Five="net", Six="hoverboard",
-}
-
-local function now() return os.clock() - Runtime.started end
-local function log(...) print("[Beeconomy Learner]", ...) end
-
-local function safe(v, depth)
-    depth = depth or 0
-    if depth > 4 then return "<deep>" end
-    local tv = typeof(v)
-    if tv == "Vector3" then return {__type="Vector3",x=v.X,y=v.Y,z=v.Z} end
-    if tv == "CFrame" then return {__type="CFrame",components={v:GetComponents()}} end
-    if tv == "Instance" then return {__type="Instance",class=v.ClassName,path=v:GetFullName()} end
-    if tv == "EnumItem" then return tostring(v) end
-    if tv == "table" then
-        local out,n = {},0
-        for k,val in pairs(v) do
-            n += 1
-            if n > 60 then out.__truncated=true break end
-            out[tostring(k)] = safe(val,depth+1)
-        end
-        return out
-    end
-    if tv=="string" or tv=="number" or tv=="boolean" or tv=="nil" then return v end
-    return tostring(v)
+local function now() return os.clock()-R.started end
+local function log(...) print("[Beeconomy V3]",...) end
+local function safe(v,d)
+ d=d or 0;if d>4 then return "<deep>" end
+ local t=typeof(v)
+ if t=="Vector3" then return {__type="Vector3",x=v.X,y=v.Y,z=v.Z} end
+ if t=="CFrame" then return {__type="CFrame",components={v:GetComponents()}} end
+ if t=="Instance" then return {__type="Instance",class=v.ClassName,path=v:GetFullName()} end
+ if t=="EnumItem" then return tostring(v) end
+ if t=="table" then local o,n={},0;for k,x in pairs(v) do n+=1;if n>50 then o.__truncated=true;break end;o[tostring(k)]=safe(x,d+1) end;return o end
+ if t=="string" or t=="number" or t=="boolean" or t=="nil" then return v end
+ return tostring(v)
 end
-
-local function getLeaderstat(name)
-    local ls=LP:FindFirstChild("leaderstats")
-    local v=ls and ls:FindFirstChild(name)
-    return v and v.Value or nil
+local function ls(name)local l=LP:FindFirstChild("leaderstats");local v=l and l:FindFirstChild(name);return v and v.Value or nil end
+local function snap()
+ local s={Level=ls("Level"),Honey=ls("Honey"),Hatches=ls("Hatches")}
+ for _,a in ipairs(ATTRS) do s[a]=LP:GetAttribute(a) end
+ local c=LP.Character;local h=c and c:FindFirstChild("HumanoidRootPart");if h then s.Position=h.Position end
+ return s
 end
-
-local function snapshot()
-    local s={Level=getLeaderstat("Level"),Honey=getLeaderstat("Honey"),Hatches=getLeaderstat("Hatches")}
-    for _,attr in ipairs(TRACKED_ATTRS) do s[attr]=LP:GetAttribute(attr) end
-    local ch=LP.Character
-    local hrp=ch and ch:FindFirstChild("HumanoidRootPart")
-    if hrp then s.Position=hrp.Position end
-    return s
-end
-
 local function push(kind,data)
-    if not CFG.Enabled then return nil end
-    local e={t=now(),kind=kind,data=safe(data)}
-    table.insert(Runtime.events,e)
-    while #Runtime.events>CFG.MaxEvents do table.remove(Runtime.events,1) end
-    if CFG.Verbose then log(kind,HttpService:JSONEncode(e.data)) end
-    return e
+ if not CFG.Enabled then return end
+ local e={t=now(),kind=kind,data=safe(data)};table.insert(R.events,e);while #R.events>CFG.MaxEvents do table.remove(R.events,1) end
+ if CFG.Verbose then log(kind,HttpService:JSONEncode(e.data)) end
+end
+local function packArgs(...)local p=table.pack(...);local a={n=p.n};for i=1,p.n do a[i]=p[i] end;return a end
+local function argc(a)return a.n or #a end
+local function sig(path,m,a)local t={};for i=1,argc(a) do t[i]=typeof(a[i]) end;return table.concat({path,m,tostring(argc(a)),table.concat(t,",")},"|") end
+local function semanticKey(m,a)local x=a[3];if type(x)=="string" then return m..":"..x end;if type(x)=="number" and x>=1 and x<=12 and x%1==0 then return m..":smallnum:"..x end;return m..":"..typeof(x) end
+local function pattern(m,a,anchored)local k=semanticKey(m,a);local p=R.patterns[k] or {count=0,anchored=0,unanchored=0};R.patterns[k]=p;p.count+=1;if anchored then p.anchored+=1 else p.unanchored+=1 end;return p end
+
+local function explicit(m,a)
+ local a3,a4=a[3],a[4]
+ if m=="InvokeServer" then
+  if a3=="hourly" or a3=="daily" or a3=="weekly" then return "reward:"..a3,98,"explicit_reward" end
+  if a3=="free" and type(a4)=="number" then return "reward:free",95,"explicit_free" end
+  if type(a4)=="table" and (a4.questId or a4.source=="npc_claim") then return "quest:claim",99,"explicit_quest_claim" end
+  if type(a3)=="string" and string.find(string.lower(a3),"quest",1,true) then return "quest",85,"explicit_quest" end
+ end
+end
+local function currentHold()return LP:GetAttribute("GripHoldKind") end
+local function shovelNow()return currentHold()=="shovel" and LP:GetAttribute("ShovelEquipped")==true end
+
+local function closeOwner(ep)
+ if not ep or ep.closed then return end
+ ep.closed=true;ep.closedAt=now();if R.owner==ep then R.owner=nil end
+end
+local function openOwner(tag,confidence,anchor,window)
+ if R.owner and not R.owner.closed then closeOwner(R.owner) end
+ R.nextEpisodeId+=1
+ local ep={id=R.nextEpisodeId,tag=tag,confidence=confidence,startedAt=now(),anchor=safe(anchor),stateAtOpen=safe(snap()),remotes={},closed=false}
+ table.insert(R.episodes,ep);while #R.episodes>CFG.MaxEpisodes do table.remove(R.episodes,1) end;R.owner=ep
+ task.delay(window or CFG.SemanticWindow,function()if R.owner==ep then closeOwner(ep) end end)
+ return ep
+end
+local function refreshSemantic(tag,confidence,anchor)
+ local ep=R.owner
+ if ep and not ep.closed and ep.tag==tag and (now()-ep.startedAt)<CFG.SemanticWindow then ep.anchorLatest=safe(anchor);return ep end
+ return openOwner(tag,confidence,anchor,CFG.SemanticWindow)
 end
 
-local function argsArray(...)
-    local p=table.pack(...)
-    local out={}
-    for i=1,p.n do out[i]=p[i] end
-    out.n=p.n
-    return out
+local function classify(m,a,owner)
+ local et,ec,er=explicit(m,a);if et then return et,ec,er end
+ local a3,a4,a5=a[3],a[4],a[5]
+ if m=="FireServer" then
+  if BG[a3] then return "background",99,"known_background" end
+  if type(a3)=="number" and a3>=1 and a3<=3 and argc(a)>=5 then return "background",98,"smallnum_burst" end
+  -- Important V3 rule: CURRENT hold must be shovel. Old episode snapshots cannot qualify.
+  if shovelNow() and type(a3)=="string" and typeof(a4)=="Vector3" and type(a5)=="table" and not BG[a3] then
+   if a3=="Dandelion" or a3==LP:GetAttribute("BeeCombatTargetFieldDb") then return "farm:field_packet",94,"current_shovel+field_packet" end
+  end
+  if owner and owner.tag=="mob:select" then
+   if type(a3)=="string" or type(a3)=="table" then return "mob:candidate",86,"owned_by_mob_select" end
+  end
+  if currentHold()=="fishing" and owner and (owner.tag=="hold:fishing" or owner.tag=="click:fishing") then return "fishing:candidate",82,"current_fishing_owner" end
+ end
+ return "unknown",0,owner and "semantic_owner_unresolved" or "unowned"
 end
 
-local function argCount(args) return args.n or #args end
-
-local function signature(path,method,args)
-    local t={}
-    for i=1,argCount(args) do t[i]=typeof(args[i]) end
-    return table.concat({path,method,tostring(argCount(args)),table.concat(t,",")},"|")
+local function record(path,m,a,tag,conf,reason,anchored)
+ local s=sig(path,m,a);local r=R.learned[s]
+ if not r then r={remote=path,method=m,argc=argc(a),types={},count=0,tags={},reasons={},anchored=0,unanchored=0,samples={}};for i=1,argc(a) do r.types[i]=typeof(a[i]) end;R.learned[s]=r end
+ r.count+=1;r.tags[tag]=(r.tags[tag] or 0)+1;r.reasons[reason]=(r.reasons[reason] or 0)+1;if anchored then r.anchored+=1 else r.unanchored+=1 end
+ if #r.samples<5 then local z={};for i=1,argc(a) do z[i]=safe(a[i]) end;table.insert(r.samples,z) end
+ return s
+end
+local function learnRemote(remote,m,a)
+ local owner=R.owner;if owner and owner.closed then owner=nil end
+ local anchored=owner~=nil;pattern(m,a,anchored)
+ local tag,conf,reason=classify(m,a,owner);local path=remote:GetFullName();local s=record(path,m,a,tag,conf,reason,anchored)
+ local rr={t=now(),remote=path,method=m,signature=s,tag=tag,confidence=conf,reason=reason,args=safe(a),state=safe(snap()),ownerId=owner and owner.id or nil,ownerTag=owner and owner.tag or nil}
+ if owner then table.insert(owner.remotes,rr) end;push("remote_out",rr)
+end
+local function installHook()
+ if R.hook then return true end
+ if not hookmetamethod or not getnamecallmethod or not newcclosure then warn("[Beeconomy V3] missing executor hook APIs");return false end
+ local old;old=hookmetamethod(game,"__namecall",newcclosure(function(self,...)
+  local m=getnamecallmethod();if CFG.Enabled and typeof(self)=="Instance" and (m=="FireServer" or m=="InvokeServer") then local a=packArgs(...);task.defer(function()pcall(learnRemote,self,m,a)end) end
+  return old(self,...)
+ end));R.hook=true;return true
 end
 
-local function semanticKey(method,args)
-    local a3=args[3]
-    if type(a3)=="string" then return method..":"..a3 end
-    if type(a3)=="number" and a3>=1 and a3<=12 and math.floor(a3)==a3 then return method..":smallnum:"..tostring(a3) end
-    return method..":"..typeof(a3)
-end
-
-local function notePattern(method,args,anchored)
-    local key=semanticKey(method,args)
-    local p=Runtime.patterns[key]
-    if not p then p={count=0,anchored=0,unanchored=0};Runtime.patterns[key]=p end
-    p.count+=1
-    if anchored then p.anchored+=1 else p.unanchored+=1 end
-    return p
-end
-
-local function explicitRemoteTag(method,args)
-    local a3,a4=args[3],args[4]
-    if method=="InvokeServer" then
-        if a3=="hourly" or a3=="daily" or a3=="weekly" then return "reward:"..a3,95 end
-        if a3=="free" and type(a4)=="number" then return "reward:free",90 end
-        if type(a4)=="table" and (a4.questId or a4.source=="npc_claim") then return "quest:claim",98 end
-        if type(a3)=="string" and string.find(string.lower(a3),"quest",1,true) then return "quest",80 end
-    end
-    return nil,0
-end
-
-local function inferAnchorTag(anchor)
-    if not anchor then return "unknown",0 end
-    if anchor.kind=="input" then
-        local key=anchor.keyShort
-        local k=HOTBAR_KIND[key]
-        if k then return "equip:"..k,75 end
-        if anchor.inputType=="MouseButton1" then return "click",45 end
-    elseif anchor.kind=="state" then
-        local n,v,old=anchor.name,anchor.value,anchor.old
-        if n=="ShovelEquipped" and v==true then return "equip:shovel",98 end
-        if n=="GripHoldKind" and type(v)=="string" then return "hold:"..v,96 end
-        if n=="ActiveHoldRevision" and old~=nil and v~=old then return "hold_revision",88 end
-        if n=="SelectedMobId" and v and v~=old then return "mob:select",90 end
-        if n=="BeeCombatTargetMobId" and v and v~=old then return "mob:target",82 end
-    elseif anchor.kind=="leaderstat" then
-        if anchor.name=="Hatches" then return "hatch_result",85 end
-        if anchor.name=="Honey" then return "honey_change",55 end
-    end
-    return "unknown",0
-end
-
-local function closeEpisode(ep)
-    if not ep or ep.closed then return end
-    ep.closed=true
-    ep.closedAt=now()
-    local bestTag,bestConf=inferAnchorTag(ep.anchor)
-    for _,r in ipairs(ep.remotes) do
-        if r.explicitConfidence and r.explicitConfidence>bestConf then
-            bestTag,bestConf=r.explicitTag,r.explicitConfidence
-        end
-    end
-    ep.tag=bestTag
-    ep.confidence=bestConf
-    Runtime.activeEpisode=nil
-end
-
-local function openEpisode(anchor)
-    if Runtime.activeEpisode and not Runtime.activeEpisode.closed then closeEpisode(Runtime.activeEpisode) end
-    local ep={id=#Runtime.episodes+1,startedAt=now(),anchor=safe(anchor),remotes={},stateAfter=safe(snapshot()),closed=false}
-    table.insert(Runtime.episodes,ep)
-    while #Runtime.episodes>CFG.MaxEpisodes do table.remove(Runtime.episodes,1) end
-    Runtime.activeEpisode=ep
-    task.delay(CFG.PostWindow,function()
-        if Runtime.activeEpisode==ep then closeEpisode(ep) end
-    end)
-    return ep
-end
-
-local function recentActionInput(maxAge)
-    local li=Runtime.lastInput
-    if not li then return nil end
-    if now()-(li.t or -999)>maxAge then return nil end
-    return li
-end
-
-local function isMeaningfulInput(input)
-    local ut=tostring(input.UserInputType)
-    local kc=tostring(input.KeyCode)
-    if ut:find("MouseButton1",1,true) then return true end
-    if ut:find("Keyboard",1,true) then
-        return not kc:find("Unknown",1,true)
-    end
-    return false
-end
-
-local function isStrongFarmCandidate(args,state,anchor)
-    local a3,a4,a5=args[3],args[4],args[5]
-    if state.GripHoldKind~="shovel" and state.ShovelEquipped~=true then return false end
-    if type(a3)~="string" or typeof(a4)~="Vector3" or type(a5)~="table" then return false end
-    if KNOWN_BACKGROUND_A3[a3] then return false end
-    if a3=="Dandelion" or a3==state.BeeCombatTargetFieldDb then
-        return anchor~=nil
-    end
-    return false
-end
-
-local function classifyRemote(method,args,state,anchor,pattern)
-    local explicit,ec=explicitRemoteTag(method,args)
-    if explicit then return explicit,ec,"explicit" end
-
-    local a3=args[3]
-    if method=="FireServer" then
-        if KNOWN_BACKGROUND_A3[a3] then return "background",98,"known_background" end
-        if type(a3)=="number" and a3>=1 and a3<=3 and argCount(args)>=5 then
-            return "background",92,"repeated_small_number" end
-        if isStrongFarmCandidate(args,state,anchor) then return "farm:candidate",88,"shovel_state+field_packet" end
-        if state.SelectedMobId or state.BeeCombatTargetMobId then
-            if anchor and anchor.kind=="state" and (anchor.name=="SelectedMobId" or anchor.name=="BeeCombatTargetMobId") then
-                return "mob:candidate",82,"mob_state_anchor"
-            end
-        end
-        if state.GripHoldKind=="fishing" and anchor then return "fishing:candidate",75,"fishing_hold_anchor" end
-    end
-
-    if not anchor and pattern and pattern.unanchored>=CFG.BackgroundThreshold and pattern.anchored==0 then
-        return "background",80,"repetitive_unanchored"
-    end
-    return "unknown",0,"insufficient_anchor"
-end
-
-local function recordLearned(path,method,args,tag,confidence,reason,anchored)
-    local sig=signature(path,method,args)
-    local rec=Runtime.learned[sig]
-    if not rec then
-        rec={remote=path,method=method,argc=argCount(args),types={},count=0,tags={},reasons={},anchored=0,unanchored=0,samples={}}
-        for i=1,argCount(args) do rec.types[i]=typeof(args[i]) end
-        Runtime.learned[sig]=rec
-    end
-    rec.count+=1
-    rec.tags[tag]=(rec.tags[tag] or 0)+1
-    rec.reasons[reason]=(rec.reasons[reason] or 0)+1
-    if anchored then rec.anchored+=1 else rec.unanchored+=1 end
-    if #rec.samples<5 then
-        local s={}
-        for i=1,argCount(args) do s[i]=safe(args[i]) end
-        table.insert(rec.samples,s)
-    end
-    return sig
-end
-
-local function learnRemote(remote,method,args)
-    local path=remote:GetFullName()
-    local state=snapshot()
-    local ep=Runtime.activeEpisode
-    local anchor=ep and ep.anchor or nil
-    if not anchor then
-        local li=recentActionInput(CFG.PreWindow)
-        if li then anchor=li end
-    end
-    local anchored=anchor~=nil
-    local pattern=notePattern(method,args,anchored)
-    local tag,confidence,reason=classifyRemote(method,args,state,anchor,pattern)
-    local sig=recordLearned(path,method,args,tag,confidence,reason,anchored)
-    local explicitTag,explicitConfidence=explicitRemoteTag(method,args)
-
-    local remoteRec={
-        t=now(),remote=path,method=method,signature=sig,tag=tag,confidence=confidence,reason=reason,
-        args=safe(args),state=safe(state),explicitTag=explicitTag,explicitConfidence=explicitConfidence,
-    }
-    if ep and not ep.closed then table.insert(ep.remotes,remoteRec) end
-    push("remote_out",remoteRec)
-end
-
-local function installNetworkObserver()
-    if Runtime.hookInstalled then return true end
-    if not hookmetamethod or not getnamecallmethod or not newcclosure then
-        warn("[Beeconomy Learner] Missing hookmetamethod/getnamecallmethod/newcclosure")
-        return false
-    end
-    local old
-    old=hookmetamethod(game,"__namecall",newcclosure(function(self,...)
-        local method=getnamecallmethod()
-        if CFG.Enabled and typeof(self)=="Instance" and (method=="FireServer" or method=="InvokeServer") then
-            local args=argsArray(...)
-            task.defer(function() pcall(learnRemote,self,method,args) end)
-        end
-        return old(self,...)
-    end))
-    Runtime.hookInstalled=true
-    log("Network observer installed")
-    return true
-end
-
-local function stateAnchor(name,old,new)
-    if ACTION_DRIVEN[name] then return true end
-    if name=="SelectedMobId" and old~=new and new~=nil then return true end
-    return false
-end
-
-local function watchState()
-    for _,attr in ipairs(TRACKED_ATTRS) do
-        Runtime.previousState[attr]=LP:GetAttribute(attr)
-        LP:GetAttributeChangedSignal(attr):Connect(function()
-            local old=Runtime.previousState[attr]
-            local new=LP:GetAttribute(attr)
-            Runtime.previousState[attr]=new
-            local data={kind="state",name=attr,old=old,value=new,snapshot=safe(snapshot())}
-            push("state",data)
-            if stateAnchor(attr,old,new) then openEpisode(data) end
-        end)
-    end
-
-    local ls=LP:FindFirstChild("leaderstats") or LP:WaitForChild("leaderstats",10)
-    if ls then
-        for _,name in ipairs({"Level","Honey","Hatches"}) do
-            local v=ls:FindFirstChild(name)
-            if v and v:IsA("ValueBase") then
-                local old=v.Value
-                v.Changed:Connect(function(new)
-                    local data={kind="leaderstat",name=name,old=old,value=new,snapshot=safe(snapshot())}
-                    old=new
-                    push("leaderstat",data)
-                    if name=="Hatches" then openEpisode(data) end
-                end)
-            end
-        end
-    end
-end
-
-local function shortKey(keyCode)
-    local s=tostring(keyCode)
-    return s:match("Enum%.KeyCode%.(.+)") or s
-end
-
-local function shortInputType(t)
-    local s=tostring(t)
-    return s:match("Enum%.UserInputType%.(.+)") or s
-end
-
+local function shortKey(k)local s=tostring(k);return s:match("Enum%.KeyCode%.(.+)") or s end
+local function shortType(t)local s=tostring(t);return s:match("Enum%.UserInputType%.(.+)") or s end
 local function watchInput()
-    UserInputService.InputBegan:Connect(function(input,processed)
-        if processed or not isMeaningfulInput(input) then return end
-        local item={
-            kind="input",inputType=shortInputType(input.UserInputType),key=tostring(input.KeyCode),keyShort=shortKey(input.KeyCode),
-            pos=safe(input.Position),t=now(),snapshot=safe(snapshot()),
-        }
-        Runtime.lastInput=item
-        push("input",item)
-        if HOTBAR_KIND[item.keyShort] or item.inputType=="MouseButton1" then openEpisode(item) end
-    end)
+ UIS.InputBegan:Connect(function(input,processed)
+  if processed then return end
+  local typ,key=shortType(input.UserInputType),shortKey(input.KeyCode)
+  local item={kind="input",inputType=typ,keyShort=key,t=now(),pos=safe(input.Position),state=safe(snap())};R.lastInput=item;push("input",item)
+  local hk=HOTBAR[key]
+  if hk then openOwner("equip:"..hk,80,item,.18);return end
+  if typ=="MouseButton1" then
+   if now()-R.lastClick<CFG.ClickDebounce then return end;R.lastClick=now()
+   local hold=currentHold();local tag=hold and ("click:"..hold) or "click"
+   -- click is intentionally weak/short; semantic state can replace it immediately.
+   openOwner(tag,50,item,CFG.ClickWindow)
+  end
+ end)
+end
+local function watchState()
+ for _,a in ipairs(ATTRS) do
+  R.prev[a]=LP:GetAttribute(a)
+  LP:GetAttributeChangedSignal(a):Connect(function()
+   local old=R.prev[a];local new=LP:GetAttribute(a);R.prev[a]=new
+   local d={kind="state",name=a,old=old,value=new,t=now(),state=safe(snap())};push("state",d)
+   if a=="GripHoldKind" and old~=new then refreshSemantic("hold:"..tostring(new),97,d)
+   elseif a=="ShovelEquipped" and old~=new then refreshSemantic(new and "equip:shovel" or "unequip:shovel",98,d)
+   elseif a=="SelectedMobId" and new and new~=old then refreshSemantic("mob:select",94,d)
+   elseif a=="ActiveHoldRevision" and new~=old then
+    -- Do NOT create a separate episode. It only strengthens the current semantic owner.
+    if R.owner and not R.owner.closed then R.owner.holdRevisionChanges=(R.owner.holdRevisionChanges or 0)+1;R.owner.lastHoldRevision=new end
+   end
+  end)
+ end
 end
 
-local function summarizeLearned()
-    local rows={}
-    for sig,rec in pairs(Runtime.learned) do
-        local bestTag,bestN="unknown",0
-        for tag,n in pairs(rec.tags) do if n>bestN then bestTag,bestN=tag,n end end
-        local bestReason,bestRN="",0
-        for reason,n in pairs(rec.reasons) do if n>bestRN then bestReason,bestRN=reason,n end end
-        table.insert(rows,{
-            signature=sig,remote=rec.remote,method=rec.method,argc=rec.argc,types=rec.types,count=rec.count,
-            bestTag=bestTag,confidence=rec.count>0 and math.floor(bestN/rec.count*100+0.5) or 0,
-            anchored=rec.anchored,unanchored=rec.unanchored,bestReason=bestReason,samples=rec.samples,
-        })
-    end
-    table.sort(rows,function(a,b)
-        if (a.bestTag=="background")~=(b.bestTag=="background") then return a.bestTag~="background" end
-        return a.count>b.count
-    end)
-    return rows
+local function summaries()
+ local out={};for s,r in pairs(R.learned) do local bt,bn="unknown",0;for t,n in pairs(r.tags) do if n>bn then bt,bn=t,n end end;table.insert(out,{signature=s,remote=r.remote,method=r.method,argc=r.argc,types=r.types,count=r.count,bestTag=bt,confidence=r.count>0 and math.floor(bn/r.count*100+.5) or 0,anchored=r.anchored,unanchored=r.unanchored,reasons=r.reasons,samples=r.samples}) end;table.sort(out,function(a,b)return a.count>b.count end);return out
 end
-
-local function summarizedEpisodes()
-    local out={}
-    for _,ep in ipairs(Runtime.episodes) do
-        local calls={}
-        for _,r in ipairs(ep.remotes) do
-            table.insert(calls,{remote=r.remote,method=r.method,tag=r.tag,confidence=r.confidence,reason=r.reason,signature=r.signature,args=r.args})
-        end
-        table.insert(out,{id=ep.id,startedAt=ep.startedAt,closedAt=ep.closedAt,anchor=ep.anchor,tag=ep.tag,confidence=ep.confidence,remotes=calls})
-    end
-    return out
+local function episodeSummaries()
+ local o={};for _,e in ipairs(R.episodes) do local c={};for _,r in ipairs(e.remotes) do c[r.tag]=(c[r.tag] or 0)+1 end;table.insert(o,{id=e.id,tag=e.tag,confidence=e.confidence,startedAt=e.startedAt,closedAt=e.closedAt,anchor=e.anchor,anchorLatest=e.anchorLatest,stateAtOpen=e.stateAtOpen,remoteCount=#e.remotes,remoteTags=c,holdRevisionChanges=e.holdRevisionChanges or 0}) end;return o
 end
-
-local function buildReport()
-    return {
-        game=game.Name,placeId=game.PlaceId,generatedAt=os.time(),sessionSeconds=now(),state=safe(snapshot()),
-        learned=summarizeLearned(),episodes=summarizedEpisodes(),patterns=safe(Runtime.patterns),
-        notes={
-            "V2 uses action/state anchored episodes.",
-            "Known repeating traffic (tool, recieveSnapshot/receiveSnapshot, MatildasMarket, numeric 1..3 bursts) is filtered as background.",
-            "Farm classification requires shovel state plus a field/Vector3/table packet near an action anchor.",
-            "Observer only; no learned remote is automatically replayed.",
-        },
-    }
+local function report()return {version=3,game=game.Name,placeId=game.PlaceId,generatedAt=os.time(),sessionSeconds=now(),state=safe(snap()),patterns=R.patterns,learned=summaries(),episodes=episodeSummaries(),notes={"V3 semantic owner model","Mouse clicks are debounced and use a short ownership window","GripHoldKind/ShovelEquipped/SelectedMobId replace weak click ownership","ActiveHoldRevision strengthens owner instead of opening a competing episode","Farm requires CURRENT GripHoldKind=shovel and ShovelEquipped=true","Observer only; no learned remote replay"}} end
+local function export()
+ local j=HttpService:JSONEncode(report());local f="Beeconomy_AutoLearnV3_"..os.time()..".json";if writefile then local ok,err=pcall(writefile,f,j);if ok then log("Saved",f);return f else warn(err) end end;print(j)
 end
-
-local function exportReport()
-    if Runtime.activeEpisode then closeEpisode(Runtime.activeEpisode) end
-    local json=HttpService:JSONEncode(buildReport())
-    local filename="Beeconomy_AutoLearnV2_"..tostring(os.time())..".json"
-    if writefile then
-        local ok,err=pcall(writefile,filename,json)
-        if ok then log("Saved",filename) return filename end
-        warn("[Beeconomy Learner] writefile failed",err)
-    end
-    print("===== BEEconomy AUTO LEARN V2 =====") print(json) print("===== END =====")
-end
-
-local function printTop()
-    print("===== LEARNED SIGNATURES V2 =====")
-    local rows=summarizeLearned()
-    for i=1,math.min(#rows,30) do
-        local r=rows[i]
-        print(string.format("[%02d] %s argc=%d x%d tag=%s (%d%%) anchor=%d bg=%d reason=%s",i,r.method,r.argc,r.count,r.bestTag,r.confidence,r.anchored,r.unanchored,r.bestReason))
-    end
-    print("===== END =====")
-end
-
 local function printEpisodes()
-    if Runtime.activeEpisode then closeEpisode(Runtime.activeEpisode) end
-    print("===== ACTION EPISODES =====")
-    local start=math.max(1,#Runtime.episodes-14)
-    for i=start,#Runtime.episodes do
-        local ep=Runtime.episodes[i]
-        print(string.format("EP#%d t=%.2f tag=%s conf=%d%% calls=%d anchor=%s",ep.id,ep.startedAt,ep.tag or "open",ep.confidence or 0,#ep.remotes,HttpService:JSONEncode(ep.anchor)))
-        for j,r in ipairs(ep.remotes) do
-            if j<=12 then print("  ",r.method,r.tag,r.confidence,r.reason,r.signature) end
-        end
-    end
-    print("===== END =====")
+ print("===== V3 EPISODES =====");local es=episodeSummaries();for i=math.max(1,#es-24),#es do local e=es[i];print(string.format("#%d %-18s conf=%d remotes=%d revisions=%d",e.id,e.tag,e.confidence,e.remoteCount,e.holdRevisionChanges)) end;print("===== END =====")
+end
+local function printTop()
+ print("===== V3 LEARNED =====");for i,r in ipairs(summaries()) do if i>20 then break end;print(string.format("[%d] %s %s argc=%d n=%d tag=%s conf=%d%% a/u=%d/%d",i,r.method,r.remote,r.argc,r.count,r.bestTag,r.confidence,r.anchored,r.unanchored)) end;print("===== END =====")
 end
 
-installNetworkObserver()
-watchState()
-watchInput()
-push("start",{state=safe(snapshot())})
-
+installHook();watchState();watchInput();push("start",{state=snap()})
 local Rayfield=loadstring(game:HttpGet(((getgenv and getgenv().RayfieldUrl) or "https://sirius.menu/rayfield")))()
-local Window=Rayfield:CreateWindow({Name="Beeconomy Auto Learner V2",Icon=0,LoadingTitle="Beeconomy Event Learner V2",LoadingSubtitle="ZEBUXHUBBY",ConfigurationSaving={Enabled=false},KeySystem=false})
-local LearnTab=Window:CreateTab("Auto Detect",4483362458)
-local DebugTab=Window:CreateTab("Debug",4483362458)
-
-LearnTab:CreateToggle({Name="Enable Event Learning",CurrentValue=CFG.Enabled,Flag="BeeLearnV2",Callback=function(v) CFG.Enabled=v end})
-LearnTab:CreateSlider({Name="Post-Action Window",Range={0.4,1.8},Increment=0.1,Suffix="s",CurrentValue=CFG.PostWindow,Flag="BeePostWindow",Callback=function(v) CFG.PostWindow=v end})
-LearnTab:CreateToggle({Name="Verbose Console",CurrentValue=CFG.Verbose,Flag="BeeVerboseV2",Callback=function(v) CFG.Verbose=v end})
-LearnTab:CreateToggle({Name="Auto Export Every 60s",CurrentValue=CFG.AutoExport,Flag="BeeAutoExportV2",Callback=function(v) CFG.AutoExport=v end})
-LearnTab:CreateButton({Name="Print Learned Signatures",Callback=printTop})
-LearnTab:CreateButton({Name="Print Action Episodes",Callback=printEpisodes})
-LearnTab:CreateButton({Name="Export V2 Report",Callback=exportReport})
-
-DebugTab:CreateButton({Name="Print Current State",Callback=function() print(HttpService:JSONEncode(safe(snapshot()))) end})
-DebugTab:CreateButton({Name="Print Background Patterns",Callback=function()
-    print("===== PATTERNS =====")
-    for k,p in pairs(Runtime.patterns) do if p.count>=3 then print(k,"count",p.count,"anchored",p.anchored,"unanchored",p.unanchored) end end
-    print("===== END =====")
-end})
-DebugTab:CreateParagraph({Title="Training V2",Content="Play normally. V2 creates an episode when a meaningful click/hotbar input or action-driven state transition happens, then associates only nearby network calls. Repeating unanchored traffic is background-filtered automatically."})
-
-task.spawn(function()
-    while task.wait(1) do
-        if CFG.AutoExport and now()-Runtime.lastExport>=CFG.ExportEvery then Runtime.lastExport=now();exportReport() end
-    end
-end)
-
-Rayfield:Notify({Title="Beeconomy Auto Learner V2",Content=Runtime.hookInstalled and "V2 active: state-anchored episodes + background filtering." or "Loaded, but network hook unavailable.",Duration=6})
-log("Loaded V2. hookInstalled =",Runtime.hookInstalled)
+local W=Rayfield:CreateWindow({Name="Beeconomy Auto Learner V3",Icon=0,LoadingTitle="Beeconomy Semantic Learner",LoadingSubtitle="ZEBUXHUBBY",ConfigurationSaving={Enabled=false},KeySystem=false})
+local T=W:CreateTab("Auto Detect",4483362458);local D=W:CreateTab("Debug",4483362458)
+T:CreateToggle({Name="Enable Learning",CurrentValue=CFG.Enabled,Flag="BeeV3Enabled",Callback=function(v)CFG.Enabled=v end})
+T:CreateToggle({Name="Verbose Console",CurrentValue=CFG.Verbose,Flag="BeeV3Verbose",Callback=function(v)CFG.Verbose=v end})
+T:CreateToggle({Name="Auto Export 60s",CurrentValue=CFG.AutoExport,Flag="BeeV3AutoExport",Callback=function(v)CFG.AutoExport=v end})
+T:CreateButton({Name="Print Semantic Episodes",Callback=printEpisodes});T:CreateButton({Name="Print Learned Signatures",Callback=printTop});T:CreateButton({Name="Export V3 Report",Callback=export})
+D:CreateButton({Name="Print Current State",Callback=function()print(HttpService:JSONEncode(safe(snap())))end})
+D:CreateParagraph({Title="V3 training",Content="Play normally. Test shovel farming, switch shovel↔axe/pickaxe, click mobs, fish, and claim rewards/quests. V3 gives traffic to one semantic owner at a time and does not replay unknown remotes."})
+task.spawn(function()while task.wait(1) do if CFG.AutoExport and now()-R.lastExport>=CFG.ExportEvery then R.lastExport=now();export() end end end)
+Rayfield:Notify({Title="Beeconomy Learner V3",Content=R.hook and "Semantic learner active" or "Loaded but network hook unavailable",Duration=6})
+log("Loaded V3; hook=",R.hook)
