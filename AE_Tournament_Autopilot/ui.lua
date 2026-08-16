@@ -23,70 +23,85 @@ joined = joined:gsub('copy%.DisplayName %.%. "  •  target "', 'copy.DisplayNam
 joined = joined:gsub('TeamSub%.Text = "Manual REFRESH only • no background scan"', 'TeamSub.Text = "Best owned copies • Trait shown may differ from current hotbar"')
 joined = joined:gsub('TeamSub%.Text = "Tap a unit to inspect placement %+ target"', 'TeamSub.Text = "Best copy from whole inventory • tap to inspect"')
 
--- Portraits: V2 proved UnitView itself contains the selected unit model. Example:
--- visible UnitView text = "8th Sword (Berserk)" while its ViewportFrame contains
--- kenpachi rigs and a fixed FOV 32 camera. So display-name text is authoritative.
-local oldAddStart = string.find(joined, "    local function findSafeViewportTemplate()\n", 1, true)
-if not oldAddStart then oldAddStart = string.find(joined, "    local function viewportNearbyText(viewport)\n", 1, true) end
-local oldAddEnd = oldAddStart and string.find(joined, "    -- Map drawing", oldAddStart, true) or nil
-if oldAddStart and oldAddEnd then
-local portraitReplacement = [[    local function guiContainsDisplayName(root, displayName)
+-- Portrait patch. IMPORTANT: patch the function that actually exists in ui_parts/03.lua.
+local oldAdd = [[    local function addUnitVisual(parent, copy, slotIndex)
+        -- Prefer the game's actual unit model. The old resolver often grabbed aura,
+        -- element or card-decoration ImageLabels from the hotbar instead of the face.
+        if modelVisual(copy.Asset, parent) then return "GAME MODEL" end
+        local source = UI.Resolver.ByAsset[copy.Asset] or UI.Resolver.BySlot[slotIndex]
+        if cloneVisual(source, parent) then return "GAME UI FALLBACK" end
+        label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
+            Bold = true, TextSize = 28, Align = Enum.TextXAlignment.Center,
+        })
+        return "TEXT"
+    end]]
+local newAdd = [[    local function unitViewHasName(unitView, displayName)
         local wanted = norm(displayName)
         if wanted == "" then return false end
-        for _, d in ipairs(root:GetDescendants()) do
-            if d:IsA("TextLabel") or d:IsA("TextButton") then
-                if norm(d.Text) == wanted then return true end
+        for _, d in ipairs(unitView:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and norm(d.Text) == wanted then
+                return true
             end
         end
         return false
     end
 
-    local function cloneViewportExact(sourceViewport, parent)
+    local function cloneExactViewport(sourceViewport, parent)
         if not sourceViewport or not sourceViewport:IsA("ViewportFrame") then return false end
-        local clone = sourceViewport:Clone()
-        clone.Name = "ExactGameUnitPortrait"
-        clone.Size = UDim2.fromScale(1,1)
-        clone.Position = UDim2.fromScale(0,0)
+        local ok, clone = pcall(function()
+            local previous = sourceViewport.Archivable
+            sourceViewport.Archivable = true
+            local result = sourceViewport:Clone()
+            sourceViewport.Archivable = previous
+            return result
+        end)
+        if not ok or not clone then return false end
+        clone.Name = "AEExactUnitViewport"
         clone.AnchorPoint = Vector2.new(0,0)
+        clone.Position = UDim2.fromScale(0,0)
+        clone.Size = UDim2.fromScale(1,1)
         clone.BackgroundTransparency = 1
+        clone.BorderSizePixel = 0
         clone.Visible = true
-        clone.Parent = parent
-        -- Cloning a ViewportFrame does not reliably preserve CurrentCamera binding.
         local camera = clone:FindFirstChildWhichIsA("Camera", true)
         if camera then clone.CurrentCamera = camera end
-        return clone:FindFirstChildWhichIsA("WorldModel", true) ~= nil and clone.CurrentCamera ~= nil
+        local world = clone:FindFirstChildWhichIsA("WorldModel", true)
+        local hasPart = world and world:FindFirstChildWhichIsA("BasePart", true) ~= nil
+        if not camera or not hasPart then clone:Destroy(); return false end
+        clone.Parent = parent
+        return true
     end
 
-    local function cloneSelectedUnitView(copy, parent)
+    local function cloneFromSelectedUnitView(copy, parent)
         local unitView = PlayerGui:FindFirstChild("UnitView")
-        if not unitView or not guiContainsDisplayName(unitView, copy.DisplayName) then return false end
-        local best = nil
+        if not unitView or not unitViewHasName(unitView, copy.DisplayName) then return false end
         for _, d in ipairs(unitView:GetDescendants()) do
             if d:IsA("ViewportFrame") and d.Visible then
                 local world = d:FindFirstChildWhichIsA("WorldModel", true)
-                if world then
-                    local hasParts = world:FindFirstChildWhichIsA("BasePart", true) ~= nil
-                    if hasParts then best = d; break end
+                if world and world:FindFirstChildWhichIsA("BasePart", true) then
+                    if cloneExactViewport(d, parent) then return true end
                 end
             end
         end
-        return best and cloneViewportExact(best,parent) or false
+        return false
     end
 
-    local function cloneNamedGameCard(copy, parent)
+    local function cloneFromNamedCard(copy, parent)
         local wanted = norm(copy.DisplayName)
-        if wanted == "" then return false end
         for _, textObject in ipairs(PlayerGui:GetDescendants()) do
             if (textObject:IsA("TextLabel") or textObject:IsA("TextButton")) and norm(textObject.Text) == wanted then
                 local node = textObject.Parent
-                for _=1,7 do
+                for _ = 1, 7 do
                     if not node then break end
                     for _, d in ipairs(node:GetDescendants()) do
-                        if d:IsA("ViewportFrame") and d.Visible and d:FindFirstChildWhichIsA("WorldModel",true) then
-                            if cloneViewportExact(d,parent) then return true end
+                        if d:IsA("ViewportFrame") and d.Visible then
+                            local world = d:FindFirstChildWhichIsA("WorldModel", true)
+                            if world and world:FindFirstChildWhichIsA("BasePart", true) and cloneExactViewport(d,parent) then
+                                return true
+                            end
                         end
                     end
-                    node=node.Parent
+                    node = node.Parent
                 end
             end
         end
@@ -94,19 +109,24 @@ local portraitReplacement = [[    local function guiContainsDisplayName(root, di
     end
 
     local function addUnitVisual(parent, copy, slotIndex)
-        -- Exact selected UnitView is strongest evidence and preserves the game's FOV 32.
-        if cloneSelectedUnitView(copy,parent) then return "EXACT UNITVIEW" end
-        if cloneNamedGameCard(copy,parent) then return "EXACT NAMED CARD" end
-        if modelVisual(copy.Asset,parent) then return "DIRECT MODEL" end
-        label(parent,tostring(copy.DisplayName):sub(1,1):upper(),UDim2.fromScale(0,0),UDim2.fromScale(1,1),{Bold=true,TextSize=28,Align=Enum.TextXAlignment.Center})
+        -- V2 evidence: UnitView text identifies the selected unit and its viewport
+        -- already contains the correct character rigs with the game's FOV 32 camera.
+        if cloneFromSelectedUnitView(copy, parent) then return "EXACT UNITVIEW" end
+        if cloneFromNamedCard(copy, parent) then return "EXACT CARD" end
+        -- Do NOT reuse hotbar ImageLabels; those caused the colored-square portraits.
+        label(parent, tostring(copy.DisplayName):sub(1,1):upper(), UDim2.fromScale(0,0), UDim2.fromScale(1,1), {
+            Bold=true, TextSize=28, Align=Enum.TextXAlignment.Center,
+        })
         return "TEXT"
-    end
-
-]]
-joined=string.sub(joined,1,oldAddStart-1)..portraitReplacement..string.sub(joined,oldAddEnd)
+    end]]
+local ps,pe = string.find(joined, oldAdd, 1, true)
+if ps then
+    joined = string.sub(joined,1,ps-1) .. newAdd .. string.sub(joined,pe+1)
+else
+    warn("[Tournament UI] portrait patch marker missing")
 end
 
--- Uniform world projection: preserve 1 stud equally on X/Z.
+-- Uniform world projection
 local oldCanvas = [[    local function toCanvas(position, bounds, size)
         local x = 24 + ((position.X - bounds.MinX) / (bounds.MaxX - bounds.MinX)) * math.max(1, size.X - 48)
         local y = 24 + ((position.Z - bounds.MinZ) / (bounds.MaxZ - bounds.MinZ)) * math.max(1, size.Y - 48)
