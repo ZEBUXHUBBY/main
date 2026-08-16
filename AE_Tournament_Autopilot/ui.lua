@@ -25,95 +25,135 @@ joined = joined:gsub('copy%.DisplayName %.%. "  •  target "', 'copy.DisplayNam
 joined = joined:gsub('TeamSub%.Text = "Manual REFRESH only • no background scan"', 'TeamSub.Text = "Best owned copies • Trait shown may differ from current hotbar"')
 joined = joined:gsub('TeamSub%.Text = "Tap a unit to inspect placement %+ target"', 'TeamSub.Text = "Best copy from whole inventory • tap to inspect"')
 
--- Game-native portrait renderer ------------------------------------------------
--- Game UI evidence shows a shared renderer driven by:
---   Frame @SafeViewport=true
---     ViewportFrame
---     ShowedModel (StringValue)
--- We clone an existing game-owned template where possible and change ShowedModel,
--- allowing the game's own viewport system to build WorldModel + fixed Camera.
-local oldAdd = [[    local function addUnitVisual(parent, copy, slotIndex)
-        local source = UI.Resolver.ByAsset[copy.Asset] or UI.Resolver.BySlot[slotIndex]
-        if cloneVisual(source, parent) then return "GAME UI" end
-        if modelVisual(copy.Asset, parent) then return "GAME MODEL" end
-        local placeholder = label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
-            Bold = true, TextSize = 28, Align = Enum.TextXAlignment.Center,
-        })
-        return "TEXT"
-    end]]
-local newAdd = [[    local function findSafeViewportTemplate()
-        for _, object in ipairs(PlayerGui:GetDescendants()) do
-            if object:IsA("GuiObject") and object:GetAttribute("SafeViewport") == true then
-                local viewport = object:FindFirstChildWhichIsA("ViewportFrame", true)
-                local showed = object:FindFirstChild("ShowedModel", true)
-                if viewport and showed and showed:IsA("StringValue") then return object end
+-- Portraits -------------------------------------------------------------------
+-- SafeViewport listeners do not initialize clones created by our UI. Instead,
+-- reuse viewport content the game has ALREADY rendered: WorldModel + fixed Camera.
+-- This keeps the exact character setup/camera chosen by Anime Expeditions.
+local oldAddStart = string.find(joined, "    local function findSafeViewportTemplate()\n", 1, true)
+local oldAddEnd = oldAddStart and string.find(joined, "    -- Map drawing", oldAddStart, true) or nil
+if oldAddStart and oldAddEnd then
+local portraitReplacement = [[    local function viewportNearbyText(viewport)
+        local words = {}
+        local node = viewport
+        for _ = 1, 5 do
+            node = node and node.Parent
+            if not node then break end
+            for _, d in ipairs(node:GetDescendants()) do
+                if (d:IsA("TextLabel") or d:IsA("TextButton")) then
+                    local text = tostring(d.Text or "")
+                    if text ~= "" and #text <= 80 then words[#words+1] = text end
+                    if #words >= 18 then break end
+                end
             end
+            if #words >= 18 then break end
         end
-        return nil
+        return norm(table.concat(words, " "))
     end
 
-    local function gameNativeVisual(asset, parent)
-        local template = findSafeViewportTemplate()
-        local holder
-        if template then
-            local ok, clone = pcall(function() return template:Clone() end)
-            if ok and clone then holder = clone end
+    local function renderedViewportScore(viewport, copy)
+        local score = 0
+        local wantedAsset = norm(copy.Asset)
+        local wantedName = norm(copy.DisplayName)
+        local nearby = viewportNearbyText(viewport)
+        if #wantedAsset >= 3 and nearby:find(wantedAsset,1,true) then score += 220 end
+        if #wantedName >= 3 and nearby:find(wantedName,1,true) then score += 260 end
+
+        local ancestor = viewport.Parent
+        for _ = 1, 4 do
+            if not ancestor then break end
+            local showed = ancestor:FindFirstChild("ShowedModel", true)
+            if showed and showed:IsA("StringValue") then
+                local showedNorm = norm(showed.Value)
+                if showedNorm == wantedAsset then score += 420 end
+                if showedNorm == wantedName then score += 420 end
+                if showedNorm:find(wantedAsset,1,true) or wantedAsset:find(showedNorm,1,true) then score += 150 end
+            end
+            ancestor = ancestor.Parent
         end
-        if not holder then
-            holder = Instance.new("Frame")
-            holder.Name = "NativeUnitViewport"
-            holder:SetAttribute("SafeViewport", true)
-            holder.BackgroundTransparency = 1
-            local viewport = Instance.new("ViewportFrame")
-            viewport.Name = "ViewportFrame"
-            viewport.BackgroundTransparency = 1
-            viewport.Size = UDim2.fromScale(1, 1)
-            viewport.Parent = holder
-            local showed = Instance.new("StringValue")
-            showed.Name = "ShowedModel"
-            showed.Parent = holder
-        end
-        holder.Name = "NativeUnitViewport"
-        holder.Position = UDim2.fromScale(0,0)
-        holder.Size = UDim2.fromScale(1,1)
-        holder.BackgroundTransparency = 1
-        holder.Visible = true
-        for _, child in ipairs(holder:GetChildren()) do
-            if child:IsA("GuiObject") and not child:IsA("ViewportFrame") then
-                child.Visible = false
+
+        local world = viewport:FindFirstChildWhichIsA("WorldModel")
+        if not world then return -math.huge end
+        local models = 0
+        for _, d in ipairs(world:GetDescendants()) do
+            if d:IsA("Model") then
+                models += 1
+                local n = norm(d.Name)
+                if n == wantedAsset then score += 500 end
+                if n == wantedName then score += 500 end
+                if #n >= 3 and (n:find(wantedAsset,1,true) or wantedAsset:find(n,1,true)) then score += 180 end
+                if d:FindFirstChildWhichIsA("Humanoid", true) then score += 35 end
             end
         end
-        local showed = holder:FindFirstChild("ShowedModel", true)
-        local viewport = holder:FindFirstChildWhichIsA("ViewportFrame", true)
-        if not showed or not viewport then holder:Destroy(); return false end
-        for _, child in ipairs(viewport:GetChildren()) do child:Destroy() end
+        if models > 0 then score += 15 end
+        if viewport.CurrentCamera then score += 45 end
+        if viewport.Visible then score += 5 end
+        return score
+    end
+
+    local function findRenderedViewport(copy)
+        local best, bestScore = nil, -math.huge
+        for _, d in ipairs(PlayerGui:GetDescendants()) do
+            if d:IsA("ViewportFrame") then
+                local score = renderedViewportScore(d, copy)
+                if score > bestScore then bestScore = score; best = d end
+            end
+        end
+        if bestScore < 180 then return nil, bestScore end
+        return best, bestScore
+    end
+
+    local function cloneRenderedViewport(copy, parent)
+        local sourceViewport = findRenderedViewport(copy)
+        if not sourceViewport then return false end
+        local sourceWorld = sourceViewport:FindFirstChildWhichIsA("WorldModel")
+        if not sourceWorld then return false end
+
+        local viewport = Instance.new("ViewportFrame")
+        viewport.Name = "GameRenderedPortrait"
         viewport.Size = UDim2.fromScale(1,1)
         viewport.Position = UDim2.fromScale(0,0)
         viewport.BackgroundTransparency = 1
-        showed.Value = ""
-        holder.Parent = parent
-        task.defer(function()
-            if holder.Parent and showed.Parent then showed.Value = tostring(asset or "") end
-        end)
+        viewport.BorderSizePixel = 0
+        viewport.Ambient = sourceViewport.Ambient
+        viewport.LightColor = sourceViewport.LightColor
+        viewport.LightDirection = sourceViewport.LightDirection
+        viewport.ImageColor3 = sourceViewport.ImageColor3
+        viewport.ImageTransparency = sourceViewport.ImageTransparency
+
+        local okWorld, world = pcall(function() return sourceWorld:Clone() end)
+        if not okWorld or not world then viewport:Destroy(); return false end
+        world.Parent = viewport
+
+        local sourceCamera = sourceViewport.CurrentCamera or sourceViewport:FindFirstChildWhichIsA("Camera", true)
+        if sourceCamera then
+            local okCamera, camera = pcall(function() return sourceCamera:Clone() end)
+            if okCamera and camera then
+                camera.Parent = viewport
+                viewport.CurrentCamera = camera
+            end
+        end
+
+        -- A rendered game viewport without a camera will remain blank; reject it.
+        if not viewport.CurrentCamera then viewport:Destroy(); return false end
+        viewport.Parent = parent
         return true
     end
 
     local function addUnitVisual(parent, copy, slotIndex)
-        if gameNativeVisual(copy.Asset, parent) then return "GAME SAFE VIEWPORT" end
-        local source = UI.Resolver.ByAsset[copy.Asset]
-        if source and source:IsA("ViewportFrame") and cloneVisual(source, parent) then return "GAME VIEWPORT CLONE" end
+        if cloneRenderedViewport(copy, parent) then return "CLONED GAME RENDER" end
+        -- Keep our direct model renderer only as a second fallback.
+        if modelVisual(copy.Asset, parent) then return "DIRECT GAME MODEL" end
         label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
             Bold = true, TextSize = 28, Align = Enum.TextXAlignment.Center,
         })
         return "TEXT"
-    end]]
-local as,ae=string.find(joined,oldAdd,1,true)
-if as then joined=string.sub(joined,1,as-1)..newAdd..string.sub(joined,ae+1) end
+    end
+
+]]
+joined = string.sub(joined,1,oldAddStart-1) .. portraitReplacement .. string.sub(joined,oldAddEnd)
+end
 
 -- Uniform world projection -----------------------------------------------------
--- Use one pixels-per-stud scale for both X and Z. This preserves geometry:
--- a world-space circle remains a circle and the route gets letterboxing instead
--- of being stretched independently on each axis.
 local oldCanvas = [[    local function toCanvas(position, bounds, size)
         local x = 24 + ((position.X - bounds.MinX) / (bounds.MaxX - bounds.MinX)) * math.max(1, size.X - 48)
         local y = 24 + ((position.Z - bounds.MinZ) / (bounds.MaxZ - bounds.MinZ)) * math.max(1, size.Y - 48)
