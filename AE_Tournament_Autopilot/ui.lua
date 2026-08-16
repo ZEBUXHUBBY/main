@@ -11,10 +11,44 @@ for _, path in ipairs(parts) do
 end
 local joined = table.concat(source,"\n")
 
--- M2 fallback: if a manual PLAN scan cannot resolve the persistent inventory yet,
--- surface the passive live Replica cache instead of leaving the whole dashboard
--- looking dead. This does not create a fake team; it only reports verified live
--- state already received from the server.
+-- Readability pass ------------------------------------------------------------
+joined = joined:gsub('TextSize = 8, Truncate = Enum.TextTruncate.AtEnd', 'TextSize = 9, Truncate = Enum.TextTruncate.AtEnd')
+joined = joined:gsub('Bold = true, TextSize = 10, Truncate = Enum.TextTruncate.AtEnd', 'Bold = true, TextSize = 11, Truncate = Enum.TextTruncate.AtEnd')
+joined = joined:gsub('Bold = true, TextSize = 7, Align = Enum.TextXAlignment.Center', 'Bold = true, TextSize = 8, Align = Enum.TextXAlignment.Center')
+joined = joined:gsub('Bold = true, TextSize = 8, Align = Enum.TextXAlignment.Right', 'Bold = true, TextSize = 9, Align = Enum.TextXAlignment.Right')
+joined = joined:gsub('Color = COLORS.Muted, TextSize = 8, Align = Enum.TextXAlignment.Center', 'Color = COLORS.Muted, TextSize = 10, Align = Enum.TextXAlignment.Center')
+joined = joined:gsub('Color = COLORS.Muted, TextSize = 10, Wrap = true, YAlign = Enum.TextYAlignment.Top', 'Color = COLORS.Muted, TextSize = 12, Wrap = true, YAlign = Enum.TextYAlignment.Top')
+joined = joined:gsub('Bold = true, TextSize = 9, Truncate = Enum.TextTruncate.AtEnd', 'Bold = true, TextSize = 11, Truncate = Enum.TextTruncate.AtEnd')
+joined = joined:gsub('Color = COLORS.Muted, TextSize = 8,', 'Color = COLORS.Muted, TextSize = 10,')
+
+-- Make it explicit that recommendations use the best owned copy, not necessarily
+-- the current hotbar copy. Show the actual Trait chosen from that copy.
+joined = joined:gsub('tostring%(copy%.Role or "DPS"%) %.%. "  •  " %.%. fmt%(copy%.CapDPS, 0%)', 'tostring(copy.Trait or "No Trait") .. "  •  " .. tostring(copy.Role or "DPS") .. "  •  " .. fmt(copy.CapDPS, 0)')
+joined = joined:gsub('copy%.DisplayName %.%. "  •  target "', 'copy.DisplayName .. "  •  " .. tostring(copy.Trait or "No Trait") .. "  •  target "')
+joined = joined:gsub('TeamSub%.Text = "Manual REFRESH only • no background scan"', 'TeamSub.Text = "Best owned copies • Trait shown may differ from current hotbar"')
+joined = joined:gsub('TeamSub%.Text = "Tap a unit to inspect placement %+ target"', 'TeamSub.Text = "Best copy from whole inventory • tap to inspect"')
+
+-- Reject tiny decorative ImageLabels as unit portraits. Prefer game ViewportFrame;
+-- otherwise the existing addUnitVisual() naturally falls back to the game model.
+local oldResolve = [[                    for alias, asset in pairs(aliases) do
+                        if #alias >= 4 and words:find(alias, 1, true) then
+                            if not UI.Resolver.ByAsset[asset] then UI.Resolver.ByAsset[asset] = descendant end
+                        end
+                    end]]
+local newResolve = [[                    for alias, asset in pairs(aliases) do
+                        if #alias >= 4 and words:find(alias, 1, true) then
+                            local size = descendant.AbsoluteSize
+                            local portraitLike = descendant:IsA("ViewportFrame") or (size.X >= 44 and size.Y >= 44 and size.X / math.max(1,size.Y) >= 0.65 and size.X / math.max(1,size.Y) <= 1.55)
+                            local existing = UI.Resolver.ByAsset[asset]
+                            if portraitLike and (not existing or (descendant:IsA("ViewportFrame") and not existing:IsA("ViewportFrame"))) then
+                                UI.Resolver.ByAsset[asset] = descendant
+                            end
+                        end
+                    end]]
+local rs,re=string.find(joined,oldResolve,1,true)
+if rs then joined=string.sub(joined,1,rs-1)..newResolve..string.sub(joined,re+1) end
+
+-- M2 fallback: surface verified passive state if a manual scan fails.
 local oldFailure = [[            if not state then
                 StageText.Text = "Scan failed: " .. tostring(analysisError)
                 return
@@ -22,28 +56,16 @@ local oldFailure = [[            if not state then
 local newFailure = [[            if not state then
                 local live = type(Brain.GetLiveReplicaCache) == "function" and Brain:GetLiveReplicaCache() or nil
                 if type(live) == "table" then
-                    local unitCount = 0
-                    for _ in pairs(type(live.Units)=="table" and live.Units or {}) do unitCount = unitCount + 1 end
-                    local profileCount = 0
-                    for _ in pairs(type(live.ProfileFields)=="table" and live.ProfileFields or {}) do profileCount = profileCount + 1 end
-                    StageText.Text = string.format("LIVE M2 • Wave %s • Yen %s • placed replicas %d • observed owned %d",
-                        tostring(live.Game and live.Game.Wave or "?"),
-                        tostring(live.PlayerGame and live.PlayerGame.Yen or "?"),
-                        unitCount, profileCount)
-                    NextType.Text = "LIVE STATE"
-                    NextTitle.Text = "Inventory snapshot not resolved yet"
-                    NextReason.Text = "Replica cache is active. Re-run this loader before the match starts to capture the initial Profile replica, then press SCAN."
-                    CostChip.Text = "WAVE " .. tostring(live.Game and live.Game.Wave or "?")
-                    TargetChip.Text = "¥ " .. tostring(live.PlayerGame and live.PlayerGame.Yen or "?")
-                    FarmChip.Text = unitCount > 0 and (tostring(unitCount) .. " PLACED REPLICAS") or "WAITING FOR UNITS"
-                    FarmChip.BackgroundColor3 = COLORS.Warn
+                    local unitCount=0;for _ in pairs(type(live.Units)=="table" and live.Units or {}) do unitCount=unitCount+1 end
+                    local profileCount=0;for _ in pairs(type(live.ProfileFields)=="table" and live.ProfileFields or {}) do profileCount=profileCount+1 end
+                    StageText.Text=string.format("LIVE M2 • Wave %s • Yen %s • placed %d • observed owned %d",tostring(live.Game and live.Game.Wave or "?"),tostring(live.PlayerGame and live.PlayerGame.Yen or "?"),unitCount,profileCount)
                 else
-                    StageText.Text = "Scan failed: " .. tostring(analysisError)
+                    StageText.Text="Scan failed: "..tostring(analysisError)
                 end
                 return
             end]]
 local s,e=string.find(joined,oldFailure,1,true)
-if s then joined=string.sub(joined,1,s-1)..newFailure..string.sub(joined,e+1) else warn("[Tournament UI M2] failure patch marker missing") end
+if s then joined=string.sub(joined,1,s-1)..newFailure..string.sub(joined,e+1) end
 
 local chunk, compileError = loadstring(joined)
 if not chunk then error("Tournament UI compile error: " .. tostring(compileError)) end
