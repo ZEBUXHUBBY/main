@@ -1,4 +1,4 @@
--- Beeconomy Automation Harness with WindUI shell
+-- Beeconomy Automation Harness with Rayfield shell
 -- Safe-by-default: normal state/UI/world interactions only.
 
 local Players = game:GetService("Players")
@@ -128,8 +128,6 @@ end
 
 local function worldInteract(target, kind)
     return doAction("WorldInteract:" .. tostring(kind), function()
-        -- Adapter point: use only normal/authorized interaction in your environment.
-        -- Example for Studio-owned tests: fireclickdetector(target)
         if typeof(getgenv) == "function" then
             local env = getgenv()
             if type(env.BeeconomyWorldInteract) == "function" then
@@ -225,89 +223,160 @@ local function questAssistStep()
     end
 end
 
--- WindUI loader. Replace URL with the exact WindUI source you trust/use.
-local WindUI
+-- Rayfield loader.
+local Rayfield
 local ok, err = pcall(function()
     local env = (typeof(getgenv) == "function") and getgenv() or _G
-    if env.WindUI then
-        WindUI = env.WindUI
+    if env.Rayfield then
+        Rayfield = env.Rayfield
         return
     end
 
-    local url = env.WindUIUrl
-    assert(type(url) == "string" and #url > 0, "Set getgenv().WindUIUrl to your trusted WindUI raw source")
-    WindUI = loadstring(game:HttpGet(url))()
+    local url = env.RayfieldUrl or "https://sirius.menu/rayfield"
+    Rayfield = loadstring(game:HttpGet(url))()
 end)
 
-if not ok then
-    warn("[Beeconomy] WindUI load failed:", err)
+if not ok or not Rayfield then
+    warn("[Beeconomy] Rayfield load failed:", err)
     return
 end
 
-local Window = WindUI:CreateWindow({
-    Title = "Beeconomy Automation",
-    Icon = "bee",
-    Author = "ZEBUXHUBBY",
-    Folder = "Beeconomy",
-    Size = UDim2.fromOffset(580, 460),
-    Transparent = true,
-    Theme = "Dark",
-    Resizable = true,
+local Window = Rayfield:CreateWindow({
+    Name = "Beeconomy Automation",
+    Icon = 0,
+    LoadingTitle = "Beeconomy Automation",
+    LoadingSubtitle = "by ZEBUXHUBBY",
+    ShowText = "Beeconomy",
+    Theme = "Default",
+    ToggleUIKeybind = "K",
+    DisableRayfieldPrompts = false,
+    DisableBuildWarnings = false,
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "Beeconomy",
+        FileName = "AutomationConfig"
+    },
+    Discord = {
+        Enabled = false,
+        Invite = "",
+        RememberJoins = true
+    },
+    KeySystem = false,
 })
 
-local FarmTab = Window:Tab({Title = "Automation", Icon = "sprout"})
-local RewardTab = Window:Tab({Title = "Rewards", Icon = "gift"})
-local DebugTab = Window:Tab({Title = "Debug", Icon = "bug"})
+local AutomationTab = Window:CreateTab("Automation", 4483362458)
+local RewardsTab = Window:CreateTab("Rewards", 4483362458)
+local DebugTab = Window:CreateTab("Debug", 4483362458)
 
-FarmTab:Toggle({
-    Title = "Dry Run",
-    Desc = "Log actions without performing them",
-    Value = Config.DryRun,
-    Callback = function(v) Config.DryRun = v end,
-})
+AutomationTab:CreateSection("Main")
 
-FarmTab:Toggle({
-    Title = "Auto Farm",
-    Value = Config.FarmEnabled,
-    Callback = function(v) Config.FarmEnabled = v end,
-})
-
-FarmTab:Toggle({
-    Title = "Auto Mobs",
-    Value = Config.MobEnabled,
-    Callback = function(v) Config.MobEnabled = v end,
-})
-
-FarmTab:Toggle({
-    Title = "Auto Fishing",
-    Value = Config.FishingEnabled,
-    Callback = function(v) Config.FishingEnabled = v end,
-})
-
-FarmTab:Toggle({
-    Title = "Quest Assist",
-    Desc = "Reads visible quest text and enables the matching normal automation module",
-    Value = Config.QuestAssist,
-    Callback = function(v) Config.QuestAssist = v end,
-})
-
-RewardTab:Button({Title = "Claim Daily Reward", Callback = claimDaily})
-RewardTab:Button({Title = "Claim Playtime Rewards", Callback = claimPlaytime})
-
-DebugTab:Button({
-    Title = "Print Current State",
-    Callback = function()
-        local s = getState()
-        for k,v in pairs(s) do print(k, v) end
+AutomationTab:CreateToggle({
+    Name = "Dry Run",
+    CurrentValue = Config.DryRun,
+    Flag = "DryRun",
+    Callback = function(v)
+        Config.DryRun = v
     end,
 })
 
-DebugTab:Paragraph({
-    Title = "Potential bug testing",
-    Desc = "The supplied report marks the obfuscated remotes as hypotheses and unresolved runtime-ID surfaces. Live replay/fuzzing is intentionally not wired here. Use a dev/test endpoint you control for state-machine, rate-policy, and spatial-validation checks.",
+AutomationTab:CreateToggle({
+    Name = "Auto Farm",
+    CurrentValue = Config.FarmEnabled,
+    Flag = "AutoFarm",
+    Callback = function(v)
+        Config.FarmEnabled = v
+    end,
 })
 
--- Main scheduler
+AutomationTab:CreateToggle({
+    Name = "Auto Mobs",
+    CurrentValue = Config.MobEnabled,
+    Flag = "AutoMobs",
+    Callback = function(v)
+        Config.MobEnabled = v
+    end,
+})
+
+AutomationTab:CreateToggle({
+    Name = "Auto Fishing",
+    CurrentValue = Config.FishingEnabled,
+    Flag = "AutoFishing",
+    Callback = function(v)
+        Config.FishingEnabled = v
+    end,
+})
+
+AutomationTab:CreateToggle({
+    Name = "Quest Assist",
+    CurrentValue = Config.QuestAssist,
+    Flag = "QuestAssist",
+    Callback = function(v)
+        Config.QuestAssist = v
+    end,
+})
+
+AutomationTab:CreateInput({
+    Name = "Preferred Field",
+    CurrentValue = Config.PreferredField,
+    PlaceholderText = "Dandelion",
+    RemoveTextAfterFocusLost = false,
+    Flag = "PreferredField",
+    Callback = function(value)
+        if type(value) == "string" and value ~= "" then
+            Config.PreferredField = value
+        end
+    end,
+})
+
+AutomationTab:CreateSlider({
+    Name = "Minimum Action Gap",
+    Range = {0.1, 2.0},
+    Increment = 0.05,
+    Suffix = "s",
+    CurrentValue = Config.MinActionGap,
+    Flag = "ActionGap",
+    Callback = function(value)
+        Config.MinActionGap = value
+    end,
+})
+
+RewardsTab:CreateSection("Normal UI Claims")
+
+RewardsTab:CreateButton({
+    Name = "Claim Daily Reward",
+    Callback = claimDaily,
+})
+
+RewardsTab:CreateButton({
+    Name = "Claim Playtime Rewards",
+    Callback = claimPlaytime,
+})
+
+DebugTab:CreateSection("State")
+
+DebugTab:CreateButton({
+    Name = "Print Current State",
+    Callback = function()
+        local s = getState()
+        for k, v in pairs(s) do
+            print("[Beeconomy State]", k, v)
+        end
+    end,
+})
+
+DebugTab:CreateButton({
+    Name = "Print Nearby Mobs",
+    Callback = function()
+        for index, entry in ipairs(findMobs()) do
+            print(string.format("[Beeconomy Mob %d] %s | %.2f studs", index, entry.mob.Name, entry.distance))
+        end
+    end,
+})
+
+DebugTab:CreateParagraph({
+    Title = "Potential bug testing",
+    Content = "The mapper report marks the obfuscated remotes as hypotheses/unresolved surfaces. Live replay or fuzzing is not wired into this automation build."
+})
 
 task.spawn(function()
     while State.Running do
@@ -319,4 +388,10 @@ task.spawn(function()
     end
 end)
 
-log("Loaded with WindUI. DryRun =", Config.DryRun)
+Rayfield:Notify({
+    Title = "Beeconomy",
+    Content = "Rayfield automation harness loaded",
+    Duration = 5,
+})
+
+log("Loaded with Rayfield. DryRun =", Config.DryRun)
