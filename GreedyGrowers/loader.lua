@@ -1,7 +1,11 @@
--- Greedy Growers diagnostic bootstrap
+-- Greedy Growers diagnostic bootstrap + passive adapter
 local Players = game:GetService("Players")
 local CoreGui = game:GetService("CoreGui")
 local player = Players.LocalPlayer
+
+local BASE = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/GreedyGrowers/"
+local MAIN_SOURCE = BASE .. "main.lua"
+local ADAPTER_SOURCE = BASE .. "passive_adapter.lua"
 
 local function makeStatusGui()
     local parent = CoreGui
@@ -15,8 +19,8 @@ local function makeStatusGui()
     gui.Name = "GreedyGrowersBootstrap"
     gui.ResetOnSpawn = false
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.fromOffset(430, 155)
-    frame.Position = UDim2.new(0.5, -215, 0, 70)
+    frame.Size = UDim2.fromOffset(460, 185)
+    frame.Position = UDim2.new(0.5, -230, 0, 70)
     frame.BackgroundColor3 = Color3.fromRGB(24,24,30)
     frame.BorderSizePixel = 0
     frame.Parent = gui
@@ -52,7 +56,7 @@ local gui, label = makeStatusGui()
 local history = {}
 local function status(text, bad)
     table.insert(history, text)
-    if #history > 6 then table.remove(history,1) end
+    if #history > 7 then table.remove(history,1) end
     print("[GreedyGrowers]", text)
     if bad then warn("[GreedyGrowers]", text) end
     if label then
@@ -60,9 +64,6 @@ local function status(text, bad)
         label.TextColor3 = bad and Color3.fromRGB(255,135,135) or Color3.fromRGB(220,220,225)
     end
 end
-
-status("[0/4] Bootstrap GUI created")
-local SOURCE = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/GreedyGrowers/main.lua"
 
 local function httpGet(url)
     local ok, body = pcall(function() return game:HttpGet(url) end)
@@ -77,26 +78,54 @@ local function httpGet(url)
     end
 end
 
-status("[1/4] Testing GitHub download...")
-local source = httpGet(SOURCE)
-if not source then status("ERROR: HTTP/request unavailable or blocked",true) return end
-status("[1/4] Download OK: "..#source.." bytes")
+local function loadRemote(url, labelName)
+    local source = httpGet(url)
+    if not source then return nil, labelName .. " download failed" end
+    if type(loadstring) ~= "function" then return nil, "loadstring unavailable" end
+    local chunk, compileErr = loadstring(source)
+    if not chunk then return nil, labelName .. " compile: " .. tostring(compileErr) end
+    local ok, result = pcall(chunk)
+    if not ok then return nil, labelName .. " runtime: " .. tostring(result) end
+    return result
+end
 
-status("[2/4] Compiling main.lua...")
-if type(loadstring)~="function" then status("ERROR: loadstring unavailable",true) return end
-local chunk, err = loadstring(source)
-if not chunk then status("ERROR compile: "..tostring(err),true) return end
-status("[2/4] Compile OK")
+status("[0/5] Bootstrap GUI created")
+status("[1/5] Loading controller...")
+local Greedy, mainErr = loadRemote(MAIN_SOURCE, "main.lua")
+if not Greedy then status("ERROR: "..tostring(mainErr), true) return end
+if type(Greedy) ~= "table" then status("ERROR: controller returned "..typeof(Greedy), true) return end
+status("[1/5] Controller OK")
 
-status("[3/4] Starting controller...")
-local ok, Greedy = pcall(chunk)
-if not ok then status("ERROR controller: "..tostring(Greedy),true) return end
-if type(Greedy)~="table" then status("ERROR: controller returned "..typeof(Greedy),true) return end
-status("[3/4] Controller OK")
+status("[2/5] Loading passive runtime adapter...")
+local Adapter, adapterErr = loadRemote(ADAPTER_SOURCE, "passive_adapter.lua")
+if not Adapter then status("ERROR: "..tostring(adapterErr), true) return Greedy end
+if type(Adapter) ~= "table" then status("ERROR: adapter returned "..typeof(Adapter), true) return Greedy end
+status("[2/5] Adapter OK")
 
-status("[4/4] Starting Rayfield...")
+status("[3/5] Attaching runtime discovery...")
+local attachOk, attachErr = pcall(function()
+    Greedy.AttachAdapter(Adapter)
+    Greedy.SetConfig({Enabled = true, AutoHarvest = false, AutoSell = false, AutoOptimize = true})
+end)
+if not attachOk then status("ERROR attach: "..tostring(attachErr), true) return Greedy end
+status("[3/5] Passive runtime active")
+
+status("[4/5] Testing discovery...")
+local trees = {}
+local discoverOk, discoverErr = pcall(function()
+    trees = Adapter:GetTrees()
+end)
+if discoverOk then
+    status("[4/5] Found "..tostring(#trees).." tree-like objects | Cash $"..tostring(Adapter:GetCash()))
+else
+    status("[4/5] Discovery warning: "..tostring(discoverErr))
+end
+
+status("[5/5] Starting Rayfield...")
 local uiok, uierr = pcall(Greedy.CreateUI)
 if not uiok then status("ERROR UI: "..tostring(uierr),true) return Greedy end
-status("[4/4] UI call completed")
+status("[5/5] READY | Passive optimizer/monitor active")
+
 getgenv().GreedyGrowers = Greedy
+getgenv().GreedyGrowersAdapter = Adapter
 return Greedy
