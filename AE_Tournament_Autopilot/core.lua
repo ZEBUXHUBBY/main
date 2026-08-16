@@ -12,10 +12,8 @@ end
 
 local joined = table.concat(source, "\n")
 
--- Legacy safeguard; core_parts/01.lua now also returns one value from ci().
 joined = joined:gsub("return value, key", "return value", 1)
 
--- Replace broad profile scanner with validated inventory-collection scanner.
 local scanStart = string.find(joined, "    local function scanProfileData()\n", 1, true)
 local nextStart = scanStart and string.find(joined, "    local function isUnitRecord", scanStart, true) or nil
 if scanStart and nextStart then
@@ -49,11 +47,8 @@ if scanStart and nextStart then
 
         local override = env.AE_TOURNAMENT_PROFILE_OVERRIDE
         if type(override) == "table" then
-            local valid, data, ownedLike, hotbarCount = inventoryEvidence(override)
-            if valid then
-                appendDiagnostic("validated profile override ownedLike=" .. tostring(ownedLike) .. " hotbar=" .. tostring(hotbarCount))
-                return data, nil
-            end
+            local valid, data = inventoryEvidence(override)
+            if valid then return data, nil end
         end
 
         if type(getgc) ~= "function" then return nil, "getgc unavailable" end
@@ -105,74 +100,57 @@ if scanStart and nextStart then
     joined = string.sub(joined,1,scanStart-1)..replacement..string.sub(joined,nextStart)
 end
 
--- Strict tactical route. Never connect arbitrary decorative map parts.
+-- Probe-verified route: Workspace.Map.Paths contains exactly ordered Parts 1..43.
+-- Live enemies report WaypointIndex 43 at the end, so this is the canonical route.
 local pathStart = string.find(joined, "    local function discoverPath()\n", 1, true)
 local pathNext = pathStart and string.find(joined, "    local function pathDistance", pathStart, true) or nil
 if pathStart and pathNext then
     local strictPath = [[    local function discoverPath()
         local map = Workspace:FindFirstChild("Map")
-        local pathRoot = map and map:FindFirstChild("Path", true)
+        if not map then
+            appendDiagnostic("verified path: Workspace.Map missing")
+            return {}, "MAP_NOT_FOUND"
+        end
+        local pathRoot = map:FindFirstChild("Paths")
         if not pathRoot then
-            appendDiagnostic("strict path: Workspace.Map.Path not found")
-            return {}, "STRICT PATH ROOT NOT FOUND"
+            appendDiagnostic("verified path: Workspace.Map.Paths missing")
+            return {}, "MAP_PATHS_NOT_FOUND"
         end
 
-        local function pointFrom(instance)
-            local position = worldPosition(instance)
-            if not position then return nil end
-            local lower = tostring(instance.Name):lower()
-            local order = tonumber(instance.Name) or tonumber(instance.Name:match("(%d+)"))
-            local namedWaypoint = lower:find("waypoint",1,true) or lower:find("node",1,true) or lower:find("point",1,true)
-            if not order and not namedWaypoint then return nil end
-            return {Position=position,Order=order,Name=instance.Name,Instance=instance}
+        local indexed = {}
+        local maxOrder = 0
+        for _, child in ipairs(pathRoot:GetChildren()) do
+            local order = tonumber(child.Name)
+            local position = order and worldPosition(child) or nil
+            if order and position then
+                indexed[order] = {Position=position, Order=order, Name=child.Name, Instance=child}
+                maxOrder = math.max(maxOrder, order)
+            end
+        end
+
+        if maxOrder < 3 then
+            return {}, "MAP_PATHS_NO_ORDER"
         end
 
         local points = {}
-        for _, child in ipairs(pathRoot:GetDescendants()) do
-            local point = pointFrom(child)
-            if point then points[#points+1]=point end
-        end
-
-        if #points < 3 then
-            appendDiagnostic("strict path: fewer than 3 ordered waypoint candidates under "..pathRoot:GetFullName())
-            return {}, "STRICT WAYPOINTS UNRESOLVED"
-        end
-
-        local ordered = 0
-        for _, point in ipairs(points) do if point.Order then ordered=ordered+1 end end
-        if ordered < 3 then
-            appendDiagnostic("strict path: waypoint names exist but numeric order unavailable")
-            return {}, "STRICT ORDER UNRESOLVED"
-        end
-
-        table.sort(points,function(a,b)
-            if a.Order and b.Order and a.Order~=b.Order then return a.Order<b.Order end
-            if a.Order and not b.Order then return true end
-            if b.Order and not a.Order then return false end
-            return tostring(a.Name)<tostring(b.Name)
-        end)
-
-        local deduped = {}
-        local seenOrder = {}
-        for _, point in ipairs(points) do
-            local orderKey = point.Order and tostring(point.Order) or nil
-            if (not orderKey or not seenOrder[orderKey]) and (#deduped==0 or (point.Position-deduped[#deduped].Position).Magnitude>0.5) then
-                deduped[#deduped+1]=point
-                if orderKey then seenOrder[orderKey]=true end
+        for order = 1, maxOrder do
+            if not indexed[order] then
+                appendDiagnostic("verified path gap at "..tostring(order))
+                return {}, "MAP_PATHS_GAP_"..tostring(order)
             end
+            points[#points+1] = indexed[order]
         end
-        if #deduped < 3 then return {}, "STRICT PATH DEDUPE FAILED" end
-        appendDiagnostic("strict path resolved points="..tostring(#deduped).." root="..pathRoot:GetFullName())
-        return deduped, "STRICT ORDERED"
+
+        appendDiagnostic("verified path resolved "..tostring(#points).." points from Workspace.Map.Paths")
+        return points, "VERIFIED_MAP_PATHS_"..tostring(#points)
     end
 
 ]]
-    joined=string.sub(joined,1,pathStart-1)..strictPath..string.sub(joined,pathNext)
+    joined = string.sub(joined,1,pathStart-1)..strictPath..string.sub(joined,pathNext)
 else
-    warn("[Tournament Brain] strict path patch marker missing")
+    warn("[Tournament Brain] verified path patch marker missing")
 end
 
--- Passive Replica cache; never triggers analysis or UI redraws.
 local tailMarker = "    return Brain\nend"
 local livePatch = [[
     function Brain:StartLiveReplicaCache()
