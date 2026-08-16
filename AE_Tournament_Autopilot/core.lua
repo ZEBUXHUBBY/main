@@ -12,12 +12,19 @@ end
 
 local joined = table.concat(source, "\n")
 
+-- ci() originally returned both value and matched key. Calls such as
+-- tonumber(ci(row,{"PlacementLimit"})) therefore passed the key string as
+-- tonumber's optional base argument and crashed once the inventory scanner
+-- finally reached real unit records. The Brain never relies on ci's second
+-- return, so make it a single-value helper before compiling the combined core.
+joined = joined:gsub("return value, key", "return value", 1)
+
 -- Replace the broad profile scanner. A placed GameUnit also owns a field named
 -- UnitData, so merely seeing UnitData is not proof of a player profile. The
 -- validated profile must look like an inventory collection: multiple Unit#GUID
--- entries and/or a real multi-slot Hotbar. Replica probes also established that
--- the local profile currently uses replica id 57, so we target maps containing
--- that id before doing a bounded table scan.
+-- entries and/or a real multi-slot Hotbar. Replica probes established that the
+-- local profile uses replica id 57 in this session, so maps containing that id
+-- get a strong source boost; the inventory validator remains the actual proof.
 local scanStart = string.find(joined, "    local function scanProfileData()\n", 1, true)
 local nextStart = scanStart and string.find(joined, "    local function isUnitRecord", scanStart, true) or nil
 if scanStart and nextStart then
@@ -40,9 +47,7 @@ if scanStart and nextStart then
                     local guidKey = keyText:find("#", 1, true) ~= nil
                     local childAsset = type(child) == "table" and ci(child, {"Asset", "Unit", "UnitName"}) or nil
                     local progression = type(child) == "table" and ci(child, {"Level", "EXP", "Trait", "StatPotential", "Worthiness", "ObtainedAt", "Equipment"}) or nil
-                    if guidKey or (type(childAsset) == "string" and progression ~= nil) then
-                        ownedLike = ownedLike + 1
-                    end
+                    if guidKey or (type(childAsset) == "string" and progression ~= nil) then ownedLike = ownedLike + 1 end
                 end
             end
             local hotbarCount = type(hotbarData) == "table" and countKeys(hotbarData) or 0
@@ -61,10 +66,7 @@ if scanStart and nextStart then
             appendDiagnostic("profile override rejected: not an inventory collection")
         end
 
-        if type(getgc) ~= "function" then
-            appendDiagnostic("getgc unavailable")
-            return nil, "getgc unavailable"
-        end
+        if type(getgc) ~= "function" then appendDiagnostic("getgc unavailable"); return nil, "getgc unavailable" end
         local ok, objects = pcall(getgc, true)
         if not ok or type(objects) ~= "table" then return nil, "getgc failed" end
 
@@ -76,14 +78,9 @@ if scanStart and nextStart then
             local score = ownedLike * 100 + hotbarCount * 35 + profilePlayerAffinity(candidate) + (sourceBoost or 0)
             if ci(data, {"ProfileData"}) ~= nil then score = score + 120 end
             if ci(data, {"ItemData"}) ~= nil then score = score + 40 end
-            if score > bestScore then
-                bestScore = score
-                bestData = data
-            end
+            if score > bestScore then bestScore = score; bestData = data end
         end
 
-        -- Target the profile replica identity proven by passive Replica events.
-        -- We inspect only shallow, likely replica maps; no function-upvalue walk.
         for index, object in ipairs(objects) do
             if type(object) == "table" then
                 inspectedTables = inspectedTables + 1
@@ -104,8 +101,6 @@ if scanStart and nextStart then
                         end
                     end
                 end
-                -- Direct profile tables are still allowed, but must pass the
-                -- inventory-collection validator above.
                 consider(object, 0)
                 local data = rawget(object, "Data")
                 if type(data) == "table" then consider(data, 25) end
