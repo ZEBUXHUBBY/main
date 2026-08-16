@@ -31,7 +31,6 @@ end
 
 function Adapter:GetCash()
     if not LocalPlayer then return 0 end
-
     local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
     if leaderstats then
         for _, name in ipairs({"Cash", "Money", "Coins", "Gold"}) do
@@ -40,13 +39,11 @@ function Adapter:GetCash()
             if n ~= nil then return n end
         end
     end
-
     for _, name in ipairs({"Cash", "Money", "Coins", "Gold"}) do
         local attr = LocalPlayer:GetAttribute(name)
         local n = parseNumber(attr)
         if n ~= nil then return n end
     end
-
     return 0
 end
 
@@ -71,11 +68,9 @@ end
 function Adapter:GetTrees()
     local out = {}
     local seen = {}
-
     for _, inst in ipairs(Workspace:GetDescendants()) do
         if looksTreeLike(inst) and not seen[inst] then
             seen[inst] = true
-
             local ready = false
             local readyAttr = inst:GetAttribute("Ready")
             if readyAttr ~= nil then
@@ -83,27 +78,96 @@ function Adapter:GetTrees()
             elseif inst:FindFirstChild("FruitSpawns") then
                 ready = #inst.FruitSpawns:GetChildren() > 0
             end
-
-            local mutation = inst:GetAttribute("Mutation")
-            local plantedAt = inst:GetAttribute("PlantedAt")
-            local readyAt = inst:GetAttribute("ReadyAt")
-            local value = inst:GetAttribute("Value") or inst:GetAttribute("SellValue")
-
             out[#out + 1] = {
                 instance = inst,
                 key = inst:GetAttribute("SeedKey") or inst:GetAttribute("TreeKey") or inst.Name,
                 name = inst.Name,
                 ready = ready,
-                mutation = mutation,
-                plantedAt = plantedAt,
-                readyAt = readyAt,
-                observedValue = value,
+                mutation = inst:GetAttribute("Mutation"),
+                plantedAt = inst:GetAttribute("PlantedAt"),
+                readyAt = inst:GetAttribute("ReadyAt"),
+                observedValue = inst:GetAttribute("Value") or inst:GetAttribute("SellValue"),
                 position = getPivotPosition(inst),
             }
         end
     end
-
     return out
+end
+
+local function collectTexts(root)
+    local texts = {}
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local t = d.Text
+            if type(t) == "string" and t ~= "" then texts[#texts + 1] = t end
+        elseif d:IsA("ProximityPrompt") then
+            if d.ObjectText and d.ObjectText ~= "" then texts[#texts + 1] = d.ObjectText end
+            if d.ActionText and d.ActionText ~= "" then texts[#texts + 1] = d.ActionText end
+        end
+    end
+    return texts
+end
+
+local function extractOfferFromRoot(root)
+    local price = parseNumber(root:GetAttribute("Price") or root:GetAttribute("Cost") or root:GetAttribute("SeedCost"))
+    local seedName = root:GetAttribute("SeedKey") or root:GetAttribute("SeedName") or root:GetAttribute("ItemName")
+    local rarity = root:GetAttribute("Rarity")
+    local texts = collectTexts(root)
+
+    for _, t in ipairs(texts) do
+        local low = t:lower()
+        if not seedName then
+            local n = t:match("^%s*(.-)%s+[Ss]eed%s*$")
+            if n and n ~= "" then seedName = n end
+        end
+        if not price and (t:find("$") or low:find("cost") or low:find("price")) then
+            local token = t:match("%$[%d,%.]+[KkMmBb]?") or t:match("[%d,%.]+[KkMmBb]?")
+            local p = token and parseNumber(token)
+            if p and p > 0 then price = p end
+        end
+        if not rarity then
+            for _, r in ipairs({"Common","Uncommon","Rare","Epic","Legendary","Mythic","Secret"}) do
+                if low:find(r:lower(), 1, true) then rarity = r; break end
+            end
+        end
+    end
+
+    if not seedName then
+        local n = root.Name:match("^(.-)[Ss]eed")
+        if n and n ~= "" then seedName = n end
+    end
+
+    if seedName and price and price > 0 then
+        return {
+            instance = root,
+            name = tostring(seedName),
+            key = tostring(seedName),
+            price = price,
+            rarity = rarity,
+            position = getPivotPosition(root),
+        }
+    end
+end
+
+function Adapter:GetSeedOffers()
+    local offers, seen = {}, {}
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("Model") or inst:IsA("Folder") then
+            local low = inst.Name:lower()
+            local candidate = low:find("seed", 1, true)
+                or inst:GetAttribute("SeedKey") ~= nil
+                or inst:GetAttribute("SeedName") ~= nil
+                or inst:GetAttribute("SeedCost") ~= nil
+            if candidate then
+                local offer = extractOfferFromRoot(inst)
+                if offer then
+                    local id = offer.key .. ":" .. tostring(offer.price) .. ":" .. inst:GetFullName()
+                    if not seen[id] then seen[id] = true; offers[#offers + 1] = offer end
+                end
+            end
+        end
+    end
+    return offers
 end
 
 function Adapter:GetInventoryCount()
@@ -113,11 +177,31 @@ function Adapter:GetInventoryCount()
     return #backpack:GetChildren()
 end
 
+function Adapter:GetHeldSeedName()
+    if not LocalPlayer then return nil end
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    for _, root in ipairs({char, backpack}) do
+        if root then
+            for _, item in ipairs(root:GetChildren()) do
+                local low = item.Name:lower()
+                if low:find("seed", 1, true) then return item.Name end
+            end
+        end
+    end
+    return nil
+end
+
 -- Explicitly non-actionable in passive mode.
 function Adapter:HarvestTree()
     return false, "passive adapter: harvest unavailable"
 end
-
+function Adapter:BuySeed()
+    return false, "passive adapter: buy unavailable"
+end
+function Adapter:PlantSeed()
+    return false, "passive adapter: plant unavailable"
+end
 function Adapter:SellAll()
     return false, "passive adapter: sell unavailable"
 end
