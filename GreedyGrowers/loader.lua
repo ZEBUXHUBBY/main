@@ -1,11 +1,13 @@
--- Greedy Growers diagnostic bootstrap + passive adapter
+-- Greedy Growers snapshot-aware bootstrap
+-- Passive observer for supplied snapshot. No server remote invocation is performed here.
 local Players = game:GetService("Players")
 local CoreGui = game:GetService("CoreGui")
 local player = Players.LocalPlayer
 
 local BASE = "https://raw.githubusercontent.com/ZEBUXHUBBY/main/main/GreedyGrowers/"
 local MAIN_SOURCE = BASE .. "main.lua"
-local ADAPTER_SOURCE = BASE .. "passive_adapter.lua"
+local SNAPSHOT_SOURCE = BASE .. "snapshot_adapter.lua"
+local FALLBACK_SOURCE = BASE .. "passive_adapter.lua"
 
 local function makeStatusGui()
     local parent = CoreGui
@@ -19,8 +21,8 @@ local function makeStatusGui()
     gui.Name = "GreedyGrowersBootstrap"
     gui.ResetOnSpawn = false
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.fromOffset(460, 185)
-    frame.Position = UDim2.new(0.5, -230, 0, 70)
+    frame.Size = UDim2.fromOffset(500, 210)
+    frame.Position = UDim2.new(0.5, -250, 0, 70)
     frame.BackgroundColor3 = Color3.fromRGB(24,24,30)
     frame.BorderSizePixel = 0
     frame.Parent = gui
@@ -35,7 +37,7 @@ local function makeStatusGui()
     title.TextSize = 18
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextColor3 = Color3.new(1,1,1)
-    title.Text = "Greedy Growers | Bootstrap"
+    title.Text = "Greedy Growers | Snapshot Monitor"
     title.Parent = frame
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
@@ -56,7 +58,7 @@ local gui, label = makeStatusGui()
 local history = {}
 local function status(text, bad)
     table.insert(history, text)
-    if #history > 7 then table.remove(history,1) end
+    if #history > 8 then table.remove(history,1) end
     print("[GreedyGrowers]", text)
     if bad then warn("[GreedyGrowers]", text) end
     if label then
@@ -78,54 +80,110 @@ local function httpGet(url)
     end
 end
 
-local function loadRemote(url, labelName)
+local function loadRemote(url, name)
     local source = httpGet(url)
-    if not source then return nil, labelName .. " download failed" end
+    if not source then return nil, name.." download failed" end
     if type(loadstring) ~= "function" then return nil, "loadstring unavailable" end
     local chunk, compileErr = loadstring(source)
-    if not chunk then return nil, labelName .. " compile: " .. tostring(compileErr) end
+    if not chunk then return nil, name.." compile: "..tostring(compileErr) end
     local ok, result = pcall(chunk)
-    if not ok then return nil, labelName .. " runtime: " .. tostring(result) end
+    if not ok then return nil, name.." runtime: "..tostring(result) end
     return result
 end
 
-status("[0/5] Bootstrap GUI created")
-status("[1/5] Loading controller...")
+status("[0/6] Bootstrap ready")
+
 local Greedy, mainErr = loadRemote(MAIN_SOURCE, "main.lua")
-if not Greedy then status("ERROR: "..tostring(mainErr), true) return end
-if type(Greedy) ~= "table" then status("ERROR: controller returned "..typeof(Greedy), true) return end
-status("[1/5] Controller OK")
+if not Greedy or type(Greedy) ~= "table" then
+    status("ERROR controller: "..tostring(mainErr or typeof(Greedy)), true)
+    return
+end
+status("[1/6] Controller OK")
 
-status("[2/5] Loading passive runtime adapter...")
-local Adapter, adapterErr = loadRemote(ADAPTER_SOURCE, "passive_adapter.lua")
-if not Adapter then status("ERROR: "..tostring(adapterErr), true) return Greedy end
-if type(Adapter) ~= "table" then status("ERROR: adapter returned "..typeof(Adapter), true) return Greedy end
-status("[2/5] Adapter OK")
+local Adapter, adapterErr = loadRemote(SNAPSHOT_SOURCE, "snapshot_adapter.lua")
+local adapterMode = "snapshot"
+if not Adapter or type(Adapter) ~= "table" then
+    status("[2/6] Snapshot adapter failed; fallback")
+    Adapter, adapterErr = loadRemote(FALLBACK_SOURCE, "passive_adapter.lua")
+    adapterMode = "generic"
+end
+if not Adapter or type(Adapter) ~= "table" then
+    status("ERROR adapter: "..tostring(adapterErr or typeof(Adapter)), true)
+    return Greedy
+end
+status("[2/6] Adapter OK: "..adapterMode)
 
-status("[3/5] Attaching runtime discovery...")
-local attachOk, attachErr = pcall(function()
+local okAttach, attachErr = pcall(function()
     Greedy.AttachAdapter(Adapter)
-    Greedy.SetConfig({Enabled = true, AutoHarvest = false, AutoSell = false, AutoOptimize = true})
+    Greedy.SetConfig({Enabled=true, AutoOptimize=true, AutoHarvest=false, AutoSell=false})
 end)
-if not attachOk then status("ERROR attach: "..tostring(attachErr), true) return Greedy end
-status("[3/5] Passive runtime active")
+if not okAttach then
+    status("ERROR attach: "..tostring(attachErr), true)
+    return Greedy
+end
+status("[3/6] Snapshot observer attached")
 
-status("[4/5] Testing discovery...")
-local trees = {}
-local discoverOk, discoverErr = pcall(function()
-    trees = Adapter:GetTrees()
-end)
-if discoverOk then
-    status("[4/5] Found "..tostring(#trees).." tree-like objects | Cash $"..tostring(Adapter:GetCash()))
+-- IMPORTANT: immediate lightning path.
+-- This fires in the same client callback that receives Event("lightning").
+-- It does not wait for CrashedAll or the controller polling loop.
+local emergencyConnection
+if Adapter.LightningObserved and type(Adapter.LightningObserved.Connect) == "function" then
+    emergencyConnection = Adapter.LightningObserved:Connect(function(ts)
+        status("LIGHTNING -> EMERGENCY HARVEST NOW")
+
+        -- Only execute an action when an explicitly writable/authorized adapter exposes it.
+        if Adapter.ReadOnly ~= true and type(Adapter.HarvestTree) == "function" and type(Adapter.GetTrees) == "function" then
+            local okTrees, trees = pcall(Adapter.GetTrees, Adapter)
+            if okTrees and type(trees) == "table" then
+                for _, tree in ipairs(trees) do
+                    task.spawn(function()
+                        local ok, result = pcall(Adapter.HarvestTree, Adapter, tree)
+                        if not ok then
+                            warn("[GreedyGrowers] Emergency harvest failed:", result)
+                        end
+                    end)
+                end
+            end
+        else
+            -- Snapshot adapter is intentionally passive/read-only.
+            -- Still mark the exact action point before CrashedAll arrives.
+            getgenv().GreedyGrowersEmergency = {
+                action = "HARVEST_NOW",
+                triggeredAt = ts or os.clock(),
+                reason = "Event(lightning)",
+                beforeCrash = true,
+            }
+        end
+    end)
+end
+status("[4/6] Lightning immediate callback armed")
+
+if type(Adapter.GetSnapshotStatus) == "function" then
+    local ok, s = pcall(Adapter.GetSnapshotStatus, Adapter)
+    if ok and s then
+        status(string.format("[5/6] Bound %s | Cash $%s | rounds %s", tostring(s.boundRemotes), tostring(s.cash), tostring(s.activeRounds)))
+    else
+        status("[5/6] Snapshot status unavailable")
+    end
 else
-    status("[4/5] Discovery warning: "..tostring(discoverErr))
+    status("[5/6] Generic adapter active")
 end
 
-status("[5/5] Starting Rayfield...")
 local uiok, uierr = pcall(Greedy.CreateUI)
-if not uiok then status("ERROR UI: "..tostring(uierr),true) return Greedy end
-status("[5/5] READY | Passive optimizer/monitor active")
+if not uiok then
+    status("ERROR UI: "..tostring(uierr), true)
+else
+    status("[6/6] READY | waiting for Event(lightning)")
+end
 
 getgenv().GreedyGrowers = Greedy
 getgenv().GreedyGrowersAdapter = Adapter
+getgenv().GreedyGrowersEmergencyConnection = emergencyConnection
+getgenv().GreedyGrowersStatus = function()
+    if type(Adapter.GetSnapshotStatus) == "function" then
+        return Adapter:GetSnapshotStatus()
+    end
+    return {mode=adapterMode, cash=Adapter.GetCash and Adapter:GetCash() or nil}
+end
+
 return Greedy
