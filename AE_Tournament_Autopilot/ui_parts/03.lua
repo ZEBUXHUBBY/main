@@ -14,18 +14,20 @@
         local _, size = model:GetBoundingBox()
         local maximum = math.max(size.X, size.Y, size.Z, 1)
         local cameraObject = Instance.new("Camera")
-        cameraObject.FieldOfView = 32
-        cameraObject.CFrame = CFrame.lookAt(Vector3.new(maximum * 1.25, maximum * 0.12, maximum * 2.45), Vector3.new(0, maximum * 0.05, 0))
+        cameraObject.FieldOfView = 30
+        cameraObject.CFrame = CFrame.lookAt(Vector3.new(maximum * 1.12, maximum * 0.10, maximum * 2.30), Vector3.new(0, maximum * 0.08, 0))
         cameraObject.Parent = viewportFrame
         viewportFrame.CurrentCamera = cameraObject
         return true
     end
 
     local function addUnitVisual(parent, copy, slotIndex)
-        local source = UI.Resolver.ByAsset[copy.Asset] or UI.Resolver.BySlot[slotIndex]
-        if cloneVisual(source, parent) then return "GAME UI" end
+        -- Prefer the game's actual unit model. The old resolver often grabbed aura,
+        -- element or card-decoration ImageLabels from the hotbar instead of the face.
         if modelVisual(copy.Asset, parent) then return "GAME MODEL" end
-        local placeholder = label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
+        local source = UI.Resolver.ByAsset[copy.Asset] or UI.Resolver.BySlot[slotIndex]
+        if cloneVisual(source, parent) then return "GAME UI FALLBACK" end
+        label(parent, tostring(copy.DisplayName):sub(1, 1):upper(), UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {
             Bold = true, TextSize = 28, Align = Enum.TextXAlignment.Center,
         })
         return "TEXT"
@@ -63,27 +65,22 @@
 
     -- Drawing -----------------------------------------------------------------
 
-    -- Draw from the midpoint rather than rotating around the start point.
-    -- A small overlap hides sub-pixel gaps at waypoint turns, so the route reads
-    -- as one continuous road instead of disconnected bars.
     local function line(parent, a, b, thickness, color, transparency)
         local delta = b - a
         local length = delta.Magnitude
-        local width = thickness or 5
         if length <= 0.01 then return nil end
-
+        local overlap = math.min(3, length * 0.15)
         local midpoint = (a + b) * 0.5
-        local overlap = math.max(2, width * 0.7)
         local object = Instance.new("Frame")
         object.AnchorPoint = Vector2.new(0.5, 0.5)
         object.Position = UDim2.fromOffset(midpoint.X, midpoint.Y)
-        object.Size = UDim2.fromOffset(length + overlap * 2, width)
+        object.Size = UDim2.fromOffset(length + overlap * 2, thickness or 5)
         object.Rotation = math.deg(math.atan2(delta.Y, delta.X))
         object.BackgroundColor3 = color or COLORS.Muted
         object.BackgroundTransparency = transparency or 0
         object.BorderSizePixel = 0
         object.Parent = parent
-        rounded(object, math.max(2, width / 2))
+        rounded(object, math.max(2, (thickness or 5) / 2))
         return object
     end
 
