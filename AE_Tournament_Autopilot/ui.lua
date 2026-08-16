@@ -9,122 +9,205 @@ for _, path in ipairs(parts) do
 end
 local joined = table.concat(source,"\n")
 
+-- Readability patches.
 joined = joined:gsub('TextSize = 8, Truncate = Enum.TextTruncate.AtEnd', 'TextSize = 9, Truncate = Enum.TextTruncate.AtEnd')
 joined = joined:gsub('Bold = true, TextSize = 10, Truncate = Enum.TextTruncate.AtEnd', 'Bold = true, TextSize = 11, Truncate = Enum.TextTruncate.AtEnd')
 joined = joined:gsub('Bold = true, TextSize = 7, Align = Enum.TextXAlignment.Center', 'Bold = true, TextSize = 8, Align = Enum.TextXAlignment.Center')
 joined = joined:gsub('Bold = true, TextSize = 8, Align = Enum.TextXAlignment.Right', 'Bold = true, TextSize = 9, Align = Enum.TextXAlignment.Right')
-joined = joined:gsub('Color = COLORS.Muted, TextSize = 8, Align = Enum.TextXAlignment.Center', 'Color = COLORS.Muted, TextSize = 10, Align = Enum.TextXAlignment.Center')
-joined = joined:gsub('Color = COLORS.Muted, TextSize = 10, Wrap = true, YAlign = Enum.TextYAlignment.Top', 'Color = COLORS.Muted, TextSize = 12, Wrap = true, YAlign = Enum.TextYAlignment.Top')
-joined = joined:gsub('Bold = true, TextSize = 9, Truncate = Enum.TextTruncate.AtEnd', 'Bold = true, TextSize = 11, Truncate = Enum.TextTruncate.AtEnd')
 joined = joined:gsub('Color = COLORS.Muted, TextSize = 8,', 'Color = COLORS.Muted, TextSize = 10,')
 joined = joined:gsub('tostring%(copy%.Role or "DPS"%) %.%. "  •  " %.%. fmt%(copy%.CapDPS, 0%)', 'tostring(copy.Trait or "No Trait") .. "  •  " .. tostring(copy.Role or "DPS") .. "  •  " .. fmt(copy.CapDPS, 0)')
 joined = joined:gsub('copy%.DisplayName %.%. "  •  target "', 'copy.DisplayName .. "  •  " .. tostring(copy.Trait or "No Trait") .. "  •  target "')
-joined = joined:gsub('TeamSub%.Text = "Manual REFRESH only • no background scan"', 'TeamSub.Text = "Best owned copies • Trait shown may differ from current hotbar"')
 joined = joined:gsub('TeamSub%.Text = "Tap a unit to inspect placement %+ target"', 'TeamSub.Text = "Best copy from whole inventory • tap to inspect"')
 
--- Portraits: use the exact image assets already loaded by the game's own unit card.
--- We first locate text that exactly matches DisplayName, then only inspect images
--- inside nearby card ancestors. This prevents grabbing unrelated hotbar icons.
+-- Portrait renderer. Portrait Render Tester V2 proved WorldModel:Clone() works
+-- reliably in this executor while cloning a whole ViewportFrame does not.
 local addStart = string.find(joined, "    local function addUnitVisual(parent, copy, slotIndex)\n", 1, true)
 local addEnd = addStart and string.find(joined, "    local function modifierChip", addStart, true) or nil
 if addStart and addEnd then
-local portrait = [[    local BAD_IMAGE_WORDS = {
-        "trait","element","rarity","star","lock","border","frame","stroke",
-        "background","bg","icon","badge","equipment","equip","target","cost",
-        "gradient","shine","glow","shadow","level","lvl","favorite","fav"
-    }
+local portrait = [[    UI.PortraitCache = UI.PortraitCache or {}
 
-    local function badImageName(name)
-        local n = norm(name)
-        for _, word in ipairs(BAD_IMAGE_WORDS) do
-            if n:find(word,1,true) then return true end
-        end
-        return false
+    local function normalizeDisplayName(value)
+        return norm(tostring(value or ""))
     end
 
-    local function exactNameLabels(displayName)
-        local wanted = norm(displayName)
-        local out = {}
-        if wanted == "" then return out end
-        for _, d in ipairs(PlayerGui:GetDescendants()) do
-            if (d:IsA("TextLabel") or d:IsA("TextButton")) and norm(d.Text) == wanted then
-                out[#out+1] = d
+    local function setTreeArchivable(root, value)
+        local backup = {}
+        local function setOne(object)
+            local ok, old = pcall(function() return object.Archivable end)
+            if ok then
+                backup[#backup + 1] = {object, old}
+                pcall(function() object.Archivable = value end)
             end
         end
-        return out
+        setOne(root)
+        for _, descendant in ipairs(root:GetDescendants()) do setOne(descendant) end
+        return backup
     end
 
-    local function imageCandidateScore(image, textObject, depth)
-        if not (image:IsA("ImageLabel") or image:IsA("ImageButton")) then return -math.huge end
-        if type(image.Image) ~= "string" or image.Image == "" then return -math.huge end
-        if badImageName(image.Name) then return -220 end
-
-        local size = image.AbsoluteSize
-        if size.X < 24 or size.Y < 24 then return -120 end
-        local score = 0
-        local ratio = size.X / math.max(1,size.Y)
-        if ratio >= 0.55 and ratio <= 1.55 then score += 80 else score -= 30 end
-        if size.X >= 48 and size.Y >= 48 then score += 55 end
-        if size.X >= 70 and size.Y >= 70 then score += 35 end
-        if size.X > 260 or size.Y > 260 then score -= 70 end
-        if image.Visible then score += 20 end
-        score -= (depth or 0) * 8
-
-        local n = norm(image.Name)
-        if n:find("portrait",1,true) or n:find("unit",1,true) or n:find("character",1,true) or n:find("model",1,true) then score += 95 end
-        if n:find("image",1,true) or n:find("display",1,true) then score += 30 end
-
-        if textObject and textObject:IsA("GuiObject") then
-            local ip = image.AbsolutePosition + image.AbsoluteSize*0.5
-            local tp = textObject.AbsolutePosition + textObject.AbsoluteSize*0.5
-            local dist = (ip-tp).Magnitude
-            if dist < 180 then score += 60 elseif dist < 320 then score += 20 end
+    local function restoreTreeArchivable(backup)
+        for _, item in ipairs(backup or {}) do
+            pcall(function() item[1].Archivable = item[2] end)
         end
-        return score
     end
 
-    local function findNamedPortrait(copy)
-        local best,bestScore=nil,-math.huge
-        for _, textObject in ipairs(exactNameLabels(copy.DisplayName)) do
-            local node = textObject.Parent
-            for depth=1,7 do
-                if not node or node == PlayerGui then break end
-                for _, d in ipairs(node:GetDescendants()) do
-                    if d:IsA("ImageLabel") or d:IsA("ImageButton") then
-                        local score = imageCandidateScore(d,textObject,depth)
-                        if score > bestScore then best,bestScore=d,score end
+    local function cloneWorld(sourceWorld)
+        if not sourceWorld then return nil end
+        local backup = setTreeArchivable(sourceWorld, true)
+        local ok, cloned = pcall(function() return sourceWorld:Clone() end)
+        restoreTreeArchivable(backup)
+        if ok and cloned and cloned:FindFirstChildWhichIsA("BasePart", true) then return cloned end
+        if cloned then cloned:Destroy() end
+        return nil
+    end
+
+    local function worldBounds(world)
+        local minX,minY,minZ = math.huge,math.huge,math.huge
+        local maxX,maxY,maxZ = -math.huge,-math.huge,-math.huge
+        local count = 0
+        for _, part in ipairs(world:GetDescendants()) do
+            if part:IsA("BasePart") and part.Transparency < 0.99 then
+                local cf, size = part.CFrame, part.Size
+                for sx=-1,1,2 do
+                    for sy=-1,1,2 do
+                        for sz=-1,1,2 do
+                            local p = cf:PointToWorldSpace(Vector3.new(size.X*sx/2,size.Y*sy/2,size.Z*sz/2))
+                            minX=math.min(minX,p.X); maxX=math.max(maxX,p.X)
+                            minY=math.min(minY,p.Y); maxY=math.max(maxY,p.Y)
+                            minZ=math.min(minZ,p.Z); maxZ=math.max(maxZ,p.Z)
+                        end
                     end
                 end
-                node = node.Parent
+                count += 1
             end
         end
-        if bestScore < 45 then return nil,bestScore end
-        return best,bestScore
+        if count == 0 then return nil end
+        return Vector3.new((minX+maxX)/2,(minY+maxY)/2,(minZ+maxZ)/2), Vector3.new(maxX-minX,maxY-minY,maxZ-minZ), count
     end
 
-    local function renderNamedPortrait(source,parent)
-        if not source then return false end
-        local image = Instance.new("ImageLabel")
-        image.Name = "AEGamePortrait"
-        image.Size = UDim2.fromScale(1,1)
-        image.Position = UDim2.fromScale(0,0)
-        image.BackgroundTransparency = 1
-        image.BorderSizePixel = 0
-        image.Image = source.Image
-        image.ImageColor3 = source.ImageColor3
-        image.ImageTransparency = 0
-        image.ImageRectOffset = source.ImageRectOffset
-        image.ImageRectSize = source.ImageRectSize
-        image.ResampleMode = source.ResampleMode
-        -- Fill the Brain portrait box while preserving the game's crop/atlas.
-        image.ScaleType = Enum.ScaleType.Crop
-        image.Parent = parent
+    local function currentUnitViewSource()
+        local unitView = PlayerGui:FindFirstChild("UnitView")
+        if not unitView then return nil end
+
+        local displayName = nil
+        -- Prefer a meaningful visible title, but accept hidden UI because the
+        -- game's WorldModel often survives after UnitView is closed.
+        for _, descendant in ipairs(unitView:GetDescendants()) do
+            if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+                local text = tostring(descendant.Text or "")
+                if text ~= "" and text ~= "???" and #text >= 4 and #text <= 70 and text:find("(",1,true) then
+                    displayName = text
+                    if descendant.Visible then break end
+                end
+            end
+        end
+        if not displayName then return nil end
+
+        local bestViewport,bestWorld,bestParts = nil,nil,0
+        for _, descendant in ipairs(unitView:GetDescendants()) do
+            if descendant:IsA("ViewportFrame") then
+                local world = descendant:FindFirstChildWhichIsA("WorldModel", true)
+                if world then
+                    local parts = 0
+                    for _, object in ipairs(world:GetDescendants()) do if object:IsA("BasePart") then parts += 1 end end
+                    if parts > bestParts then
+                        bestViewport,bestWorld,bestParts = descendant,world,parts
+                    end
+                end
+            end
+        end
+        if not bestWorld or bestParts == 0 then return nil end
+        local camera = bestViewport.CurrentCamera or bestViewport:FindFirstChildWhichIsA("Camera",true)
+        return {
+            DisplayName = displayName,
+            Viewport = bestViewport,
+            World = bestWorld,
+            FOV = camera and camera.FieldOfView or 32,
+            CameraCFrame = camera and camera.CFrame or CFrame.new(0,0,10),
+            Parts = bestParts,
+        }
+    end
+
+    local function captureCurrentPortrait()
+        local source = currentUnitViewSource()
+        if not source then return nil end
+        local cloned = cloneWorld(source.World)
+        if not cloned then return nil end
+        local key = normalizeDisplayName(source.DisplayName)
+        local old = UI.PortraitCache[key]
+        if old and old.World then pcall(function() old.World:Destroy() end) end
+        UI.PortraitCache[key] = {
+            DisplayName = source.DisplayName,
+            World = cloned,
+            FOV = source.FOV,
+            LookVector = source.CameraCFrame.LookVector,
+            UpVector = source.CameraCFrame.UpVector,
+            Parts = source.Parts,
+        }
+        return UI.PortraitCache[key]
+    end
+
+    local function cacheFor(copy)
+        local key = normalizeDisplayName(copy.DisplayName)
+        local cached = UI.PortraitCache[key]
+        if cached and cached.World and cached.World.Parent == nil then return cached end
+
+        -- Capture whatever the game's UnitView is currently showing. If it is
+        -- this copy, it becomes available immediately; otherwise it is cached
+        -- for the corresponding team card when that unit is rendered later.
+        captureCurrentPortrait()
+        return UI.PortraitCache[key]
+    end
+
+    local function renderCachedPortrait(cache, parent)
+        if not cache or not cache.World then return false end
+        local world = cloneWorld(cache.World)
+        if not world then return false end
+
+        local viewport = Instance.new("ViewportFrame")
+        viewport.Name = "AEUnitPortrait"
+        viewport.Size = UDim2.fromScale(1,1)
+        viewport.Position = UDim2.fromScale(0,0)
+        viewport.BackgroundTransparency = 1
+        viewport.BorderSizePixel = 0
+        viewport.Ambient = Color3.fromRGB(205,205,215)
+        viewport.LightColor = Color3.fromRGB(255,246,236)
+        viewport.LightDirection = Vector3.new(-1,-1,-1)
+        viewport.Parent = parent
+        world.Parent = viewport
+
+        for _, descendant in ipairs(world:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                descendant.Anchored = true
+                descendant.CanCollide = false
+            elseif descendant:IsA("ParticleEmitter") or descendant:IsA("Beam") or descendant:IsA("Trail") then
+                descendant.Enabled = false
+            end
+        end
+
+        local center,size = worldBounds(world)
+        if not center then viewport:Destroy(); return false end
+
+        local camera = Instance.new("Camera")
+        camera.FieldOfView = tonumber(cache.FOV) or 32
+        local look = cache.LookVector or Vector3.new(0,0,-1)
+        local up = cache.UpVector or Vector3.new(0,1,0)
+        if look.Magnitude < 0.1 then look = Vector3.new(0,0,-1) end
+
+        -- Portrait crop: closer than the tester's full-body framing. Use body
+        -- height as the main constraint so the face/torso fills a 54x54 card.
+        local halfFov = math.rad(math.clamp(camera.FieldOfView,15,70)*0.5)
+        local portraitHeight = math.max(size.Y * 0.72, size.X * 0.58, size.Z * 0.42, 1)
+        local distance = portraitHeight / math.max(0.12,math.tan(halfFov)) * 0.82
+        local target = center + Vector3.new(0,size.Y*0.12,0)
+        camera.CFrame = CFrame.lookAt(target - look.Unit*distance, target, up)
+        camera.Parent = viewport
+        viewport.CurrentCamera = camera
         return true
     end
 
-    local function addUnitVisual(parent,copy,slotIndex)
-        local source = findNamedPortrait(copy)
-        if source and renderNamedPortrait(source,parent) then return "NAMED GAME PORTRAIT" end
+    local function addUnitVisual(parent, copy, slotIndex)
+        local cache = cacheFor(copy)
+        if cache and renderCachedPortrait(cache,parent) then return "WORLDMODEL CACHE" end
         label(parent,tostring(copy.DisplayName):sub(1,1):upper(),UDim2.fromScale(0,0),UDim2.fromScale(1,1),{
             Bold=true,TextSize=28,Align=Enum.TextXAlignment.Center
         })
@@ -137,7 +220,7 @@ else
     warn("[Tournament UI] addUnitVisual marker missing")
 end
 
--- Preserve equal world scale on the tactical map.
+-- Preserve one uniform stud-to-pixel scale on tactical map.
 local oldCanvas=[[    local function toCanvas(position, bounds, size)
         local x = 24 + ((position.X - bounds.MinX) / (bounds.MaxX - bounds.MinX)) * math.max(1, size.X - 48)
         local y = 24 + ((position.Z - bounds.MinZ) / (bounds.MaxZ - bounds.MinZ)) * math.max(1, size.Y - 48)
