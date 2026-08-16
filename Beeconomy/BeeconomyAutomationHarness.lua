@@ -1,397 +1,273 @@
--- Beeconomy Automation Harness with Rayfield shell
--- Safe-by-default: normal state/UI/world interactions only.
+-- Beeconomy Rayfield Automation
+-- Built from observed Beeconomy mapper signatures. Unknown actions are not guessed.
 
 local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local LP = Players.LocalPlayer
 
-local Config = {
-    DryRun = true,
-    MinActionGap = 0.35,
-    FarmEnabled = false,
-    MobEnabled = false,
-    FishingEnabled = false,
-    QuestAssist = true,
-    DailyRewards = true,
-    PlaytimeRewards = true,
-    PreferredField = "Dandelion",
-    AuthorizedTestMode = false,
+if game.PlaceId ~= 101558830312092 then
+    warn("[Beeconomy] Unexpected place:", game.PlaceId)
+end
+
+local CFG = {
+    Farm = false,
+    Mobs = false,
+    Fishing = false,
+    QuestAssist = false,
+    AutoHourly = false,
+    Field = "Dandelion",
+    Gap = 0.45,
 }
 
-local State = {
-    LastActionAt = 0,
-    Running = true,
-}
-
-local function log(...)
-    print("[Beeconomy]", ...)
+local lastAction = 0
+local function log(...) print("[Beeconomy]", ...) end
+local function ready()
+    if os.clock() - lastAction < CFG.Gap then return false end
+    lastAction = os.clock()
+    return true
 end
 
-local function canAct()
-    return os.clock() - State.LastActionAt >= Config.MinActionGap
+local Details = ReplicatedStorage:WaitForChild("Core"):WaitForChild("Details")
+local EventRemote = Details:WaitForChild("e_7d9a2f31")
+local FunctionRemote = Details:WaitForChild("f_4c81b6e2")
+
+local SESSION_KEY = "7babad1b53c84bffb74659a0cb526b19"
+local HARVEST_OPCODE = 3637647479 -- observed repeatedly for Dandelion harvest packets
+local HOURLY_OPCODE = 4171703067 -- observed hourly reward claim
+
+local function pg()
+    return LP:FindFirstChildOfClass("PlayerGui") or LP:FindFirstChild("PlayerGui")
 end
 
-local function doAction(label, fn)
-    if not canAct() then return false, "throttled" end
-    State.LastActionAt = os.clock()
-
-    if Config.DryRun then
-        log("DRY RUN", label)
-        return true, "dry-run"
+local function resolve(root, path)
+    local n = root
+    for _,name in ipairs(path) do
+        n = n and n:FindFirstChild(name)
+        if not n then return nil end
     end
-
-    local ok, result = pcall(fn)
-    if not ok then
-        warn("[Beeconomy]", label, result)
-        return false, result
-    end
-    return result ~= false, result
+    return n
 end
 
-local function getPlayerGui()
-    return LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
-end
-
-local function resolve(root, parts)
-    local node = root
-    for _, name in ipairs(parts) do
-        node = node and node:FindFirstChild(name)
-        if not node then return nil end
+local function clickGui(btn)
+    if not btn or not btn:IsA("GuiButton") then return false end
+    local ok = pcall(function() btn:Activate() end)
+    if ok then return true end
+    if firesignal then
+        local ok2 = pcall(function() firesignal(btn.MouseButton1Click) end)
+        if ok2 then return true end
     end
-    return node
+    local pos = btn.AbsolutePosition + btn.AbsoluteSize/2
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(pos.X,pos.Y,0,true,game,0)
+        task.wait()
+        VirtualInputManager:SendMouseButtonEvent(pos.X,pos.Y,0,false,game,0)
+    end)
+    return true
 end
 
 local GUI = {
-    Playtime = {"MiddleGui","MenuMain","LeftSideBar","ButtonGrid","PlaytimeCell","Playtime"},
-    Quests = {"MiddleGui","MenuMain","BottomDock","BottomBar","MenuShortcutStrip","RightShortcuts","Quests","IconButton"},
-    Craft = {"MiddleGui","MenuMain","BottomDock","BottomBar","ButtonRow","Craft","IconButton"},
     Shovel = {"MiddleGui","MenuMain","ButtonStack","Hotbar","basic_shovel"},
-    FishingRod = {"MiddleGui","MenuMain","ButtonStack","Hotbar","wooden_fishing_rod"},
-    DailyClaim = {"MiddleGui","TabContainer","PlaytimePanel","Main","ContentArea","TabHost","DailyRewardsCanvas","DailyRewardsHost","Featured","Info","ClaimButton"},
-    PlaytimeGifts = {"MiddleGui","TabContainer","PlaytimePanel","Main","ContentArea","TabHost","PlaytimeCanvas","PlaytimeRewardsHost","Inner","Slots","Gifts"},
+    Rod = {"MiddleGui","MenuMain","ButtonStack","Hotbar","wooden_fishing_rod"},
+    Playtime = {"MiddleGui","MenuMain","LeftSideBar","ButtonGrid","PlaytimeCell","Playtime"},
+    Craft = {"MiddleGui","MenuMain","BottomDock","BottomBar","ButtonRow","Craft","IconButton"},
 }
 
-local function activate(path, label)
-    local gui = getPlayerGui()
-    local button = gui and resolve(gui, path)
-    if not button or not button:IsA("GuiButton") or not button.Visible then
-        return false, "button unavailable"
-    end
-    return doAction(label, function()
-        button:Activate()
-        return true
-    end)
+local function clickPath(path)
+    local root = pg()
+    local b = root and resolve(root,path)
+    return clickGui(b)
 end
 
-local function getState()
-    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    local function stat(name)
-        local v = leaderstats and leaderstats:FindFirstChild(name)
-        return v and v.Value or nil
-    end
+local function rootPart()
+    local ch = LP.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart")
+end
 
-    return {
-        Level = stat("Level"),
-        Honey = stat("Honey"),
-        Hatches = stat("Hatches"),
-        EquippedPickaxeId = LocalPlayer:GetAttribute("EquippedPickaxeId"),
-        ShovelEquipped = LocalPlayer:GetAttribute("ShovelEquipped"),
-        EquippedAxeId = LocalPlayer:GetAttribute("EquippedAxeId"),
-        EquippedNetId = LocalPlayer:GetAttribute("EquippedNetId"),
-        EquippedFishingRodId = LocalPlayer:GetAttribute("EquippedFishingRodId"),
-        ActiveHoldRevision = LocalPlayer:GetAttribute("ActiveHoldRevision"),
-        BeeCombatTargetMobId = LocalPlayer:GetAttribute("BeeCombatTargetMobId"),
-        BeeCombatTargetFieldDb = LocalPlayer:GetAttribute("BeeCombatTargetFieldDb"),
-        SelectedMobId = LocalPlayer:GetAttribute("SelectedMobId"),
-        GripHoldKind = LocalPlayer:GetAttribute("GripHoldKind"),
+local function currentField()
+    return LP:GetAttribute("BeeCombatTargetFieldDb") or CFG.Field
+end
+
+local function equipShovel()
+    if LP:GetAttribute("ShovelEquipped") then return true end
+    clickPath(GUI.Shovel)
+    task.wait(0.15)
+    return LP:GetAttribute("ShovelEquipped") == true
+end
+
+local function getHarvestPoints(center)
+    -- Observed packets contain 3-6 nearby Vector3 flower/ground points.
+    -- We only create local nearby points; the server remains authoritative.
+    local points = {}
+    local offsets = {
+        Vector3.new(-2.0,-3.1, 1.0),
+        Vector3.new( 2.4,-3.1, 2.6),
+        Vector3.new(-2.5,-3.1,-2.2),
+        Vector3.new( 2.6,-3.1,-3.0),
+        Vector3.new(-0.4,-3.1,-1.2),
+        Vector3.new( 0.8,-3.1, 0.4),
     }
+    for _,off in ipairs(offsets) do
+        points[#points+1] = center + off
+    end
+    return points
 end
 
-local function findMobs()
-    local world = workspace:FindFirstChild("World1")
-    local runtime = world and world:FindFirstChild("Runtime")
-    local mobsFolder = runtime and runtime:FindFirstChild("Mobs")
-    local out = {}
-    if not mobsFolder then return out end
+local function farmOnce()
+    if not ready() then return end
+    local hrp = rootPart()
+    if not hrp then return end
+    if not equipShovel() then
+        log("Could not equip shovel")
+        return
+    end
 
-    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    for _, mob in ipairs(mobsFolder:GetChildren()) do
-        local click = mob:FindFirstChild("BeeMobTargetClick", true)
-        if click and click:IsA("ClickDetector") then
-            local part = mob.PrimaryPart or mob:FindFirstChildWhichIsA("BasePart", true)
-            local distance = (hrp and part) and (hrp.Position - part.Position).Magnitude or math.huge
-            table.insert(out, {mob = mob, click = click, distance = distance})
+    local field = currentField()
+    local pos = hrp.Position
+    local points = getHarvestPoints(pos)
+    local ok,err = pcall(function()
+        EventRemote:FireServer(SESSION_KEY, HARVEST_OPCODE, field, pos, points)
+    end)
+    if not ok then warn("[Beeconomy] harvest failed",err) end
+end
+
+local function mobList()
+    local out = {}
+    for _,d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("ClickDetector") and d.Name == "BeeMobTargetClick" then
+            local part = d.Parent
+            local hrp = rootPart()
+            local dist = math.huge
+            if hrp and part and part:IsA("BasePart") then
+                dist = (hrp.Position-part.Position).Magnitude
+            end
+            out[#out+1] = {cd=d,dist=dist}
         end
     end
-    table.sort(out, function(a,b) return a.distance < b.distance end)
+    table.sort(out,function(a,b) return a.dist < b.dist end)
     return out
 end
 
-local function worldInteract(target, kind)
-    return doAction("WorldInteract:" .. tostring(kind), function()
-        if typeof(getgenv) == "function" then
-            local env = getgenv()
-            if type(env.BeeconomyWorldInteract) == "function" then
-                return env.BeeconomyWorldInteract(target, kind)
-            end
+local function clickDetector(cd)
+    if not cd then return false end
+    if fireclickdetector then
+        local ok = pcall(fireclickdetector,cd)
+        return ok
+    end
+    return false
+end
+
+local function mobOnce()
+    if not ready() then return end
+    local list = mobList()
+    if list[1] then
+        if not clickDetector(list[1].cd) then
+            log("Executor has no fireclickdetector")
         end
-        error("Define getgenv().BeeconomyWorldInteract(target, kind) for your authorized environment")
+    end
+end
+
+local function fishingOnce()
+    if not ready() then return end
+    clickPath(GUI.Rod)
+    task.wait(0.1)
+    for _,d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("ClickDetector") and d.Name == "FishingWaterClick" then
+            if clickDetector(d) then return end
+        end
+    end
+end
+
+local function claimHourly()
+    local ok,result = pcall(function()
+        return FunctionRemote:InvokeServer(SESSION_KEY,HOURLY_OPCODE,"hourly",1)
     end)
-end
-
-local function farmStep()
-    if not Config.FarmEnabled then return end
-    local s = getState()
-    if not s.ShovelEquipped then
-        activate(GUI.Shovel, "Equip shovel")
-        return
+    if ok then
+        log("Hourly result", result and result.success)
+        return result
     end
-
-    if typeof(getgenv) == "function" then
-        local env = getgenv()
-        if type(env.BeeconomyFarmField) == "function" then
-            doAction("Farm " .. tostring(s.BeeCombatTargetFieldDb or Config.PreferredField), function()
-                return env.BeeconomyFarmField(s.BeeCombatTargetFieldDb or Config.PreferredField, s)
-            end)
-        end
-    end
+    warn("[Beeconomy] hourly failed",result)
 end
 
-local function mobStep()
-    if not Config.MobEnabled then return end
-    local mobs = findMobs()
-    if mobs[1] then
-        worldInteract(mobs[1].click, "BeeMobTargetClick")
-    end
-end
-
-local function fishingStep()
-    if not Config.FishingEnabled then return end
-    local world = workspace:FindFirstChild("World1")
-    local water = world and world:FindFirstChild("Water")
-    local click = water and water:FindFirstChild("FishingWaterClick", true)
-    if not click then return end
-    activate(GUI.FishingRod, "Equip fishing rod")
-    worldInteract(click, "FishingWaterClick")
-end
-
-local function claimDaily()
-    activate(GUI.Playtime, "Open playtime")
-    task.wait(0.2)
-    activate(GUI.DailyClaim, "Claim daily reward")
-end
-
-local function claimPlaytime()
-    activate(GUI.Playtime, "Open playtime")
-    task.wait(0.2)
-    local gui = getPlayerGui()
-    local gifts = gui and resolve(gui, GUI.PlaytimeGifts)
-    if not gifts then return end
-    for _, gift in ipairs(gifts:GetChildren()) do
-        local claim = gift:FindFirstChild("ClaimButton", true)
-        if claim and claim:IsA("GuiButton") and claim.Visible then
-            doAction("Claim playtime " .. gift.Name, function()
-                claim:Activate()
-                return true
-            end)
-            task.wait(Config.MinActionGap)
-        end
-    end
-end
-
-local function questAssistStep()
-    if not Config.QuestAssist then return end
-    local gui = getPlayerGui()
-    local box = gui and resolve(gui, {"MiddleGui","QuestBox"})
-    if not box then return end
-
-    local text = {}
-    for _, d in ipairs(box:GetDescendants()) do
+local function questText()
+    local root = pg()
+    local box = root and resolve(root,{"MiddleGui","QuestBox"})
+    if not box then return "" end
+    local t = {}
+    for _,d in ipairs(box:GetDescendants()) do
         if d:IsA("TextLabel") and d.Visible and d.Text ~= "" then
-            table.insert(text, string.lower(d.Text))
+            t[#t+1] = string.lower(d.Text)
         end
     end
-    local joined = table.concat(text, " ")
+    return table.concat(t," ")
+end
 
-    if string.find(joined, "pollen", 1, true) or string.find(joined, "honey", 1, true) then
-        Config.FarmEnabled = true
-    elseif string.find(joined, "mob", 1, true) or string.find(joined, "ladybug", 1, true) or string.find(joined, "spider", 1, true) or string.find(joined, "snail", 1, true) or string.find(joined, "boss", 1, true) then
-        Config.MobEnabled = true
-    elseif string.find(joined, "fish", 1, true) then
-        Config.FishingEnabled = true
-    elseif string.find(joined, "craft", 1, true) then
-        activate(GUI.Craft, "Open craft for quest")
+local function questOnce()
+    local q = questText()
+    if q == "" then return end
+    if q:find("pollen",1,true) or q:find("honey",1,true) then
+        farmOnce()
+    elseif q:find("mob",1,true) or q:find("ladybug",1,true) or q:find("spider",1,true) or q:find("snail",1,true) or q:find("boss",1,true) then
+        mobOnce()
+    elseif q:find("fish",1,true) then
+        fishingOnce()
+    elseif q:find("craft",1,true) then
+        clickPath(GUI.Craft)
     end
 end
 
--- Rayfield loader.
-local Rayfield
-local ok, err = pcall(function()
-    local env = (typeof(getgenv) == "function") and getgenv() or _G
-    if env.Rayfield then
-        Rayfield = env.Rayfield
-        return
-    end
-
-    local url = env.RayfieldUrl or "https://sirius.menu/rayfield"
-    Rayfield = loadstring(game:HttpGet(url))()
-end)
-
-if not ok or not Rayfield then
-    warn("[Beeconomy] Rayfield load failed:", err)
-    return
-end
-
+local Rayfield = loadstring(game:HttpGet(((getgenv and getgenv().RayfieldUrl) or "https://sirius.menu/rayfield")))()
 local Window = Rayfield:CreateWindow({
     Name = "Beeconomy Automation",
     Icon = 0,
-    LoadingTitle = "Beeconomy Automation",
-    LoadingSubtitle = "by ZEBUXHUBBY",
-    ShowText = "Beeconomy",
-    Theme = "Default",
-    ToggleUIKeybind = "K",
-    DisableRayfieldPrompts = false,
-    DisableBuildWarnings = false,
-    ConfigurationSaving = {
-        Enabled = true,
-        FolderName = "Beeconomy",
-        FileName = "AutomationConfig"
-    },
-    Discord = {
-        Enabled = false,
-        Invite = "",
-        RememberJoins = true
-    },
+    LoadingTitle = "Beeconomy",
+    LoadingSubtitle = "ZEBUXHUBBY",
+    ConfigurationSaving = {Enabled=false},
     KeySystem = false,
 })
 
-local AutomationTab = Window:CreateTab("Automation", 4483362458)
-local RewardsTab = Window:CreateTab("Rewards", 4483362458)
-local DebugTab = Window:CreateTab("Debug", 4483362458)
+local AutoTab = Window:CreateTab("Automation",4483362458)
+local RewardTab = Window:CreateTab("Rewards",4483362458)
+local DebugTab = Window:CreateTab("Debug",4483362458)
 
-AutomationTab:CreateSection("Main")
+AutoTab:CreateToggle({Name="Auto Farm",CurrentValue=false,Flag="BeeFarm",Callback=function(v) CFG.Farm=v end})
+AutoTab:CreateToggle({Name="Auto Mobs",CurrentValue=false,Flag="BeeMobs",Callback=function(v) CFG.Mobs=v end})
+AutoTab:CreateToggle({Name="Auto Fishing",CurrentValue=false,Flag="BeeFish",Callback=function(v) CFG.Fishing=v end})
+AutoTab:CreateToggle({Name="Quest Assist",CurrentValue=false,Flag="BeeQuest",Callback=function(v) CFG.QuestAssist=v end})
+AutoTab:CreateInput({Name="Preferred Field",CurrentValue=CFG.Field,PlaceholderText="Dandelion",RemoveTextAfterFocusLost=false,Flag="BeeField",Callback=function(v) if v and v~="" then CFG.Field=v end end})
+AutoTab:CreateSlider({Name="Action Gap",Range={0.25,2},Increment=0.05,Suffix="s",CurrentValue=CFG.Gap,Flag="BeeGap",Callback=function(v) CFG.Gap=v end})
 
-AutomationTab:CreateToggle({
-    Name = "Dry Run",
-    CurrentValue = Config.DryRun,
-    Flag = "DryRun",
-    Callback = function(v)
-        Config.DryRun = v
-    end,
-})
+RewardTab:CreateButton({Name="Claim Hourly Reward",Callback=claimHourly})
+RewardTab:CreateToggle({Name="Auto Hourly Claim",CurrentValue=false,Flag="BeeHourly",Callback=function(v) CFG.AutoHourly=v end})
 
-AutomationTab:CreateToggle({
-    Name = "Auto Farm",
-    CurrentValue = Config.FarmEnabled,
-    Flag = "AutoFarm",
-    Callback = function(v)
-        Config.FarmEnabled = v
-    end,
-})
+DebugTab:CreateButton({Name="Test Farm Once",Callback=farmOnce})
+DebugTab:CreateButton({Name="Test Nearest Mob",Callback=mobOnce})
+DebugTab:CreateButton({Name="Test Fishing Click",Callback=fishingOnce})
+DebugTab:CreateButton({Name="Print State",Callback=function()
+    print("Field",currentField())
+    print("ShovelEquipped",LP:GetAttribute("ShovelEquipped"))
+    print("GripHoldKind",LP:GetAttribute("GripHoldKind"))
+    print("ActiveHoldRevision",LP:GetAttribute("ActiveHoldRevision"))
+    print("SelectedMobId",LP:GetAttribute("SelectedMobId"))
+    print("BeeCombatTargetMobId",LP:GetAttribute("BeeCombatTargetMobId"))
+end})
 
-AutomationTab:CreateToggle({
-    Name = "Auto Mobs",
-    CurrentValue = Config.MobEnabled,
-    Flag = "AutoMobs",
-    Callback = function(v)
-        Config.MobEnabled = v
-    end,
-})
-
-AutomationTab:CreateToggle({
-    Name = "Auto Fishing",
-    CurrentValue = Config.FishingEnabled,
-    Flag = "AutoFishing",
-    Callback = function(v)
-        Config.FishingEnabled = v
-    end,
-})
-
-AutomationTab:CreateToggle({
-    Name = "Quest Assist",
-    CurrentValue = Config.QuestAssist,
-    Flag = "QuestAssist",
-    Callback = function(v)
-        Config.QuestAssist = v
-    end,
-})
-
-AutomationTab:CreateInput({
-    Name = "Preferred Field",
-    CurrentValue = Config.PreferredField,
-    PlaceholderText = "Dandelion",
-    RemoveTextAfterFocusLost = false,
-    Flag = "PreferredField",
-    Callback = function(value)
-        if type(value) == "string" and value ~= "" then
-            Config.PreferredField = value
-        end
-    end,
-})
-
-AutomationTab:CreateSlider({
-    Name = "Minimum Action Gap",
-    Range = {0.1, 2.0},
-    Increment = 0.05,
-    Suffix = "s",
-    CurrentValue = Config.MinActionGap,
-    Flag = "ActionGap",
-    Callback = function(value)
-        Config.MinActionGap = value
-    end,
-})
-
-RewardsTab:CreateSection("Normal UI Claims")
-
-RewardsTab:CreateButton({
-    Name = "Claim Daily Reward",
-    Callback = claimDaily,
-})
-
-RewardsTab:CreateButton({
-    Name = "Claim Playtime Rewards",
-    Callback = claimPlaytime,
-})
-
-DebugTab:CreateSection("State")
-
-DebugTab:CreateButton({
-    Name = "Print Current State",
-    Callback = function()
-        local s = getState()
-        for k, v in pairs(s) do
-            print("[Beeconomy State]", k, v)
-        end
-    end,
-})
-
-DebugTab:CreateButton({
-    Name = "Print Nearby Mobs",
-    Callback = function()
-        for index, entry in ipairs(findMobs()) do
-            print(string.format("[Beeconomy Mob %d] %s | %.2f studs", index, entry.mob.Name, entry.distance))
-        end
-    end,
-})
-
-DebugTab:CreateParagraph({
-    Title = "Potential bug testing",
-    Content = "The mapper report marks the obfuscated remotes as hypotheses/unresolved surfaces. Live replay or fuzzing is not wired into this automation build."
-})
-
+local lastHourlyTry = 0
 task.spawn(function()
-    while State.Running do
-        questAssistStep()
-        farmStep()
-        mobStep()
-        fishingStep()
-        task.wait(0.5)
+    while task.wait(0.15) do
+        if CFG.QuestAssist then
+            questOnce()
+        else
+            if CFG.Farm then farmOnce() end
+            if CFG.Mobs then mobOnce() end
+            if CFG.Fishing then fishingOnce() end
+        end
+        if CFG.AutoHourly and os.clock()-lastHourlyTry > 60 then
+            lastHourlyTry=os.clock()
+            claimHourly()
+        end
     end
 end)
 
-Rayfield:Notify({
-    Title = "Beeconomy",
-    Content = "Rayfield automation harness loaded",
-    Duration = 5,
-})
-
-log("Loaded with Rayfield. DryRun =", Config.DryRun)
+Rayfield:Notify({Title="Beeconomy",Content="Rayfield automation loaded",Duration=4})
+log("Loaded. Direct actions enabled.")
