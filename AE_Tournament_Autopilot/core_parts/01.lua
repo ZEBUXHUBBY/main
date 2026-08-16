@@ -78,13 +78,13 @@ return function(config)
     end
 
     local function ci(tableValue, names)
-        if type(tableValue) ~= "table" then return nil, nil end
+        if type(tableValue) ~= "table" then return nil end
         local wanted = {}
         for _, name in ipairs(names or {}) do wanted[norm(name)] = true end
         for key, value in pairs(tableValue) do
-            if wanted[norm(key)] then return value, key end
+            if wanted[norm(key)] then return value end
         end
-        return nil, nil
+        return nil
     end
 
     local function numberCI(tableValue, names)
